@@ -379,29 +379,27 @@ function repairInflatedTokenTotals() {
       return;
     }
 
-    const timer = setTimeout(() => {
-      (async () => {
-        try {
-          dbModule.db.exec(
-            "CREATE TABLE IF NOT EXISTS token_usage_pre_repair_v2 AS SELECT * FROM token_usage"
+    const timer = setTimeout(async () => {
+      try {
+        dbModule.db.exec(
+          "CREATE TABLE IF NOT EXISTS token_usage_pre_repair_v2 AS SELECT * FROM token_usage"
+        );
+        const { reconcileTokens } = require("../scripts/import-history");
+        const result = await reconcileTokens(dbModule, { all: true, resetBaselines: true });
+        if (result.sessionsTouched > 0) {
+          console.log(
+            `Repaired token totals for ${result.sessionsTouched} session(s) ` +
+              `(issues #293 and #345). Pre-repair values kept in token_usage_pre_repair_v2.`
           );
-          const { reconcileTokens } = require("../scripts/import-history");
-          const result = await reconcileTokens(dbModule, { all: true, resetBaselines: true });
-          if (result.sessionsTouched > 0) {
-            console.log(
-              `Repaired token totals for ${result.sessionsTouched} session(s) ` +
-                `(issues #293 and #345). Pre-repair values kept in token_usage_pre_repair_v2.`
-            );
-          }
-          try {
-            fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`);
-          } catch {
-            /* non-fatal — the (idempotent) repair simply re-runs next start */
-          }
-        } catch (err) {
-          console.warn("token total repair failed:", err.message);
         }
-      })();
+        try {
+          fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`);
+        } catch {
+          /* non-fatal — the (idempotent) repair simply re-runs next start */
+        }
+      } catch (err) {
+        console.warn("token total repair failed:", err.message);
+      }
     }, 8_000);
     if (timer.unref) timer.unref();
   } catch (err) {
@@ -895,14 +893,15 @@ function createIngestRetryBudget(maxAttempts) {
 // Negative process evidence is valid only for files observed before the census
 // and while the DB has not changed. Positive evidence remains conservative.
 // A busy collector may defer absence decisions to the next watchdog census.
-function createCodexProbeFence(transcripts, db) {
+function createCodexProbeFence(transcripts, db, observations) {
   const fs = require("node:fs");
   const { databaseGeneration } = require("./lib/readonly-query");
   const signature = (stat) => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
   const before = new Map();
   for (const file of transcripts) {
     try {
-      before.set(file, signature(fs.statSync(file)));
+      const stat = observations ? observations.get(file) : fs.statSync(file);
+      if (stat) before.set(file, signature(stat));
     } catch {}
   }
   const generation = databaseGeneration(db);
@@ -918,7 +917,7 @@ function startCodexSessionSync(broadcast) {
   const fs = require("fs");
   const { getCodexHome, getCodexSessionsDir, onCodexHomeChanged } = require("./lib/codex-home");
   const {
-    findCodexTranscripts,
+    findCodexTranscriptsAsync,
     ingestCodexToolEvents,
     ingestCodexTranscript,
     reconcileCodexSessionLiveness,
@@ -938,6 +937,7 @@ function startCodexSessionSync(broadcast) {
   let toolBackfillDone = false;
   const toolIngestFailed = new Set();
   const retryBudget = createIngestRetryBudget(Number(process.env.DASHBOARD_CODEX_MAX_ATTEMPTS));
+  let homeEpoch = 0;
   let running = false;
   let queued = false;
   let watcher = null;
@@ -973,14 +973,23 @@ function startCodexSessionSync(broadcast) {
     running = true;
     try {
       const sessionsDir = getCodexSessionsDir();
+      const epoch = homeEpoch;
+      const isCurrent = () => epoch === homeEpoch && sessionsDir === getCodexSessionsDir();
       // A newly selected Codex home may not contain `sessions/` yet. Retry
       // watcher attachment on each safety-net sweep so it becomes event-driven
       // as soon as Codex creates the directory instead of polling forever.
       watchSessionsDir();
       watchCodexHome();
-      const transcripts = findCodexTranscripts(sessionsDir);
-      const selectLiveTranscripts = createCodexProbeFence(transcripts, require("./db").db);
+      const observations = new Map();
+      const transcripts = await findCodexTranscriptsAsync(sessionsDir, { observations, isCurrent });
+      if (!isCurrent()) return;
+      const selectLiveTranscripts = createCodexProbeFence(
+        transcripts,
+        require("./db").db,
+        observations
+      );
       const rolloutProbe = await liveness.probeLiveCodexRolloutsAsync();
+      if (!isCurrent()) return;
       // Hooks are the lowest-latency signal, but Codex may delay a new hook
       // until the user approves it. Its local thread row is written at CLI
       // launch, so use it to create the same Waiting card immediately.
@@ -993,10 +1002,12 @@ function startCodexSessionSync(broadcast) {
         const transcriptPath = transcripts[index];
         let stat;
         try {
-          stat = fs.statSync(transcriptPath);
+          stat = await fs.promises.stat(transcriptPath);
         } catch {
+          if (!isCurrent()) return;
           continue;
         }
+        if (!isCurrent()) return;
         const fingerprint = `${stat.size}:${stat.mtimeMs}`;
         const changed = fingerprints.get(transcriptPath) !== fingerprint;
         const ingestKey = `ingest:${transcriptPath}`;
@@ -1082,6 +1093,7 @@ function startCodexSessionSync(broadcast) {
         // run between imports while preserving the single-sweep cursor guard.
         if (index > 0 && index % 12 === 0) {
           await new Promise((resolve) => setImmediate(resolve));
+          if (!isCurrent()) return;
         }
       }
       // Only after one complete pass over every discovered transcript has the
@@ -1195,6 +1207,7 @@ function startCodexSessionSync(broadcast) {
   // fingerprints, re-arm the watcher, and schedule a fresh sweep after the
   // response has been sent so a large history never delays the UI action.
   onCodexHomeChanged(() => {
+    homeEpoch++;
     fingerprints.clear();
     toolBackfillDone = false; // new home → new corpus needs one full backfill pass
     toolIngestFailed.clear();
