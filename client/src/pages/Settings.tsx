@@ -126,7 +126,8 @@ import {
   subscribeToSoundPrefs,
   type SoundPrefs,
 } from "../lib/sound";
-import { fmt, fmtCost, getCurrentLocale } from "../lib/format";
+import { fmt, fmtCostFull, getCurrentLocale } from "../lib/format";
+import { CostCoverage } from "../components/CostCoverage";
 import { subscribeToPush, unsubscribeFromPush } from "../lib/push";
 import { Tip } from "../components/Tip";
 import { ImportHistory } from "../components/ImportHistory";
@@ -419,55 +420,6 @@ function formatUsdRate(rate: number): string {
     minimumFractionDigits: 2,
     maximumFractionDigits: 4,
   }).format(rate);
-}
-
-/**
- * Animate a number toward `end` with an ease-out curve over `durationMs`, starting from the
- * currently displayed value, using requestAnimationFrame. Used for the stat counters so a refresh
- * glides to the new value instead of jumping. Resets to 0 when `end` is null.
- *
- * @param end - Target value, or null to reset.
- * @param durationMs - Animation length; defaults to 1 second.
- * @returns The value to render for the current frame.
- */
-function useCountUp(end: number | null, durationMs = 1000) {
-  const [count, setCount] = useState(0);
-
-  useEffect(() => {
-    if (end === null) {
-      setCount(0);
-      return;
-    }
-
-    let startTimestamp: number | null = null;
-    let animationFrameId: number;
-    const startValue = count;
-
-    /**
-     * One animation frame: move toward the target along an ease-out-quart curve and schedule the
-     * next frame until done.
-     *
-     * @param timestamp - Frame time from `requestAnimationFrame`.
-     */
-    const step = (timestamp: number) => {
-      if (!startTimestamp) startTimestamp = timestamp;
-      const progress = Math.min((timestamp - startTimestamp) / durationMs, 1);
-      // easeOutQuart
-      const easeProgress = 1 - Math.pow(1 - progress, 4);
-      setCount(startValue + (end - startValue) * easeProgress);
-
-      if (progress < 1) {
-        animationFrameId = window.requestAnimationFrame(step);
-      } else {
-        setCount(end);
-      }
-    };
-
-    animationFrameId = window.requestAnimationFrame(step);
-    return () => window.cancelAnimationFrame(animationFrameId);
-  }, [end, durationMs]);
-
-  return count;
 }
 
 // ─── Toggle component ───
@@ -1509,6 +1461,8 @@ export function Settings() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [totalCost, setTotalCost] = useState<number | null>(null);
+  const [unpriced, setUnpriced] = useState<import("../lib/types").UnpricedModel[]>([]);
+  const costLoadGeneration = useRef(0);
   const [sysInfo, setSysInfo] = useState<SystemInfo | null>(null);
   const infoRequestRef = useRef<Promise<SystemInfo> | null>(null);
   const infoGenerationRef = useRef(0);
@@ -1584,7 +1538,6 @@ export function Settings() {
 
   const wsConnected = useSyncExternalStore(eventBus.onConnection, () => eventBus.connected);
   const [dataScope, setDataScope] = useDataScope();
-  const animatedTotalCost = useCountUp(totalCost);
 
   // Deep links (`/settings#alerts`) are how the command palette reaches an
   // individual section. React Router does not scroll to a hash on its own, and
@@ -1680,27 +1633,51 @@ export function Settings() {
   const load = useCallback(
     async (freshInfo = false) => {
       const generation = infoGenerationRef.current;
+      const costGeneration = ++costLoadGeneration.current;
       try {
-        const [pricingRes, costRes, , claudeHomeRes, codexHomeRes] = await Promise.all([
+        const [pricingRes, , , claudeHomeRes, codexHomeRes] = await Promise.all([
           api.pricing.list(),
-          api.pricing.totalCost(),
+          api.pricing.totalCost().then((costRes) => {
+            if (
+              infoMountedRef.current &&
+              generation === infoGenerationRef.current &&
+              costGeneration === costLoadGeneration.current
+            ) {
+              setTotalCost(costRes.total_cost);
+              setUnpriced(costRes.unpriced_models || []);
+            }
+            return costRes;
+          }),
           refreshInfo(freshInfo),
           api.settings.claudeHome.get(),
           api.settings.codexHome.get(),
         ]);
-        if (!infoMountedRef.current || generation !== infoGenerationRef.current) return;
+        if (
+          !infoMountedRef.current ||
+          generation !== infoGenerationRef.current ||
+          costGeneration !== costLoadGeneration.current
+        )
+          return;
         setPricing(pricingRes.pricing);
-        setTotalCost(costRes.total_cost);
         setClaudeHomeState(claudeHomeRes.claude_home);
         setClaudeHomeInput(claudeHomeRes.claude_home);
         setCodexHomeState(codexHomeRes.codex_home);
         setCodexHomeInput(codexHomeRes.codex_home);
         setError(null);
       } catch (err) {
-        if (infoMountedRef.current && generation === infoGenerationRef.current)
+        if (
+          infoMountedRef.current &&
+          generation === infoGenerationRef.current &&
+          costGeneration === costLoadGeneration.current
+        )
           setError(err instanceof Error ? err.message : t("messages.failedLoad"));
       } finally {
-        if (infoMountedRef.current && generation === infoGenerationRef.current) setLoading(false);
+        if (
+          infoMountedRef.current &&
+          generation === infoGenerationRef.current &&
+          costGeneration === costLoadGeneration.current
+        )
+          setLoading(false);
       }
     },
     [t, dataScope, refreshInfo]
@@ -1711,6 +1688,8 @@ export function Settings() {
   });
 
   useEffect(() => {
+    setTotalCost(null);
+    setUnpriced([]);
     load();
   }, [load]);
 
@@ -2356,7 +2335,7 @@ export function Settings() {
                       : undefined
                   }
                 >
-                  {totalCost !== null ? fmtCost(animatedTotalCost) : "$-.--"}
+                  {totalCost !== null ? fmtCostFull(totalCost) : "$-.--"}
                 </Tip>
               </p>
             </div>
@@ -2368,6 +2347,7 @@ export function Settings() {
         </div>
       </div>
 
+      <CostCoverage scope={dataScope} unpriced={unpriced} />
       {/* ─── PRODUCT DATA DISPLAY ─── */}
       <section id="data-display" className="scroll-mt-24">
         <div className="mb-4">

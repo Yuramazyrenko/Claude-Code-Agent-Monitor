@@ -12,6 +12,7 @@ import { StrictMode } from "react";
 import { Settings } from "../Settings";
 import { api } from "../../lib/api";
 import { eventBus } from "../../lib/eventBus";
+import { setScope } from "../../lib/dataScope";
 
 const { info } = vi.hoisted(() => ({ info: vi.fn() }));
 vi.mock("../../lib/api", () => ({
@@ -99,6 +100,7 @@ function remoteCompletion() {
 beforeEach(() => {
   vi.useFakeTimers();
   info.mockReset().mockResolvedValue(fixture());
+  setScope({ mode: "local", selected: [], provider: "both" });
   Element.prototype.scrollIntoView = vi.fn();
   const Observer = class {
     observe() {}
@@ -110,6 +112,32 @@ beforeEach(() => {
   };
   vi.stubGlobal("ResizeObserver", Observer);
   vi.stubGlobal("IntersectionObserver", Observer);
+});
+
+it("an old scope cannot overwrite the latest exact cost", async () => {
+  let oldResolve!: (value: { total_cost: number }) => void;
+  let newResolve!: (value: { total_cost: number }) => void;
+  const oldCost = new Promise((resolve) => {
+    oldResolve = resolve;
+  });
+  const newCost = new Promise((resolve) => {
+    newResolve = resolve;
+  });
+  vi.mocked(api.pricing.totalCost)
+    .mockReturnValueOnce(oldCost as never)
+    .mockReturnValueOnce(newCost as never);
+  await mount();
+  await act(async () => {
+    setScope({ mode: "all", selected: [], provider: "both" });
+  });
+  await act(async () => {
+    newResolve({ total_cost: 1018.59 });
+  });
+  expect(screen.getByText("$1,018.59")).toBeInTheDocument();
+  await act(async () => {
+    oldResolve({ total_cost: 1000 });
+  });
+  expect(screen.getByText("$1,018.59")).toBeInTheDocument();
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -290,4 +318,12 @@ describe("Settings system-info refresh", () => {
     });
     expect(info).toHaveBeenCalledTimes(3);
   });
+});
+
+it("does not discard a successful cost result when system-info reading fails", async () => {
+  info.mockRejectedValueOnce(new Error("System info reader is busy"));
+  vi.mocked(api.pricing.totalCost).mockResolvedValue({ total_cost: 1234.56 } as never);
+  await mount();
+  expect(screen.getByText("$1,234.56")).toBeInTheDocument();
+  expect(screen.getByText("System info reader is busy")).toBeInTheDocument();
 });
