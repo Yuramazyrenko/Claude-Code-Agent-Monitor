@@ -13,7 +13,9 @@
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
 
-const { execFileSync } = require("node:child_process");
+const { execFileSync, execFile } = require("node:child_process");
+const { promisify } = require("node:util");
+const execFileAsync = promisify(execFile);
 const fs = require("node:fs");
 const path = require("node:path");
 const { isInsideContainer } = require("../../scripts/install-hooks");
@@ -189,8 +191,167 @@ function probeLiveCodexRollouts() {
   return { available: true, paths };
 }
 
+// Each consumer starts its census after capturing its own lifecycle fence.
+// Watchdog/reaper and discovery callers bound their complete work separately;
+// sharing an older discovery census could close a newly active session at boot.
+function probeLiveCwdsAsync(binary = "claude") {
+  return probeLiveCwdsAsyncImpl(binary);
+}
+function probeLiveCodexRolloutsAsync() {
+  return probeLiveCodexRolloutsAsyncImpl();
+}
+async function probeLiveCwdsAsyncImpl(binary = "claude") {
+  if (probeDisabledByEnv()) return UNAVAILABLE();
+  if (process.platform === "win32") return UNAVAILABLE();
+  if (isInsideContainer()) return UNAVAILABLE();
+
+  let psOut;
+  try {
+    psOut = (
+      await execFileAsync("ps", ["-Ao", "pid=,args="], {
+        encoding: "utf8",
+        timeout: 5_000,
+        maxBuffer: 16 * 1024 * 1024,
+      })
+    ).stdout;
+  } catch {
+    return UNAVAILABLE();
+  }
+
+  const pids = [];
+  for (const line of psOut.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (m && isAgentCommand(m[2], binary)) pids.push(m[1]);
+  }
+  const cwds = new Set();
+  if (pids.length === 0) return { available: true, cwds };
+
+  if (process.platform === "linux") {
+    // /proc is authoritative and needs no external binary.
+    for (const pid of pids) {
+      try {
+        cwds.add(path.resolve(await fs.promises.readlink(`/proc/${pid}/cwd`)));
+      } catch {
+        return UNAVAILABLE(); // An incomplete census cannot prove absence.
+      }
+    }
+    return { available: true, cwds };
+  }
+
+  // macOS (and other BSD-likes): resolve each pid's cwd via lsof. `-Fn`
+  // machine format emits `p<pid>` / `f cwd` / `n<path>` records.
+  let lsofOut;
+  try {
+    lsofOut = (
+      await execFileAsync("lsof", ["-a", "-p", pids.join(","), "-d", "cwd", "-Fn"], {
+        encoding: "utf8",
+        timeout: 10_000,
+        maxBuffer: 16 * 1024 * 1024,
+      })
+    ).stdout;
+  } catch {
+    // Partial output cannot establish absence for every pid in the census.
+    return UNAVAILABLE();
+  }
+  const observedPids = new Set(
+    lsofOut
+      .split("\n")
+      .filter((line) => /^p\d+$/.test(line))
+      .map((line) => line.slice(1))
+  );
+  if (pids.some((pid) => !observedPids.has(pid))) return UNAVAILABLE();
+  const resolvedPids = new Set();
+  let currentPid = null;
+  for (const line of lsofOut.split("\n")) {
+    if (/^p\d+$/.test(line)) currentPid = line.slice(1);
+    if (line.startsWith("n") && path.posix.isAbsolute(line.slice(1))) {
+      cwds.add(path.resolve(line.slice(1)));
+      resolvedPids.add(currentPid);
+    }
+  }
+  if (pids.some((pid) => !resolvedPids.has(pid))) return UNAVAILABLE();
+  return { available: true, cwds };
+}
+
+async function probeLiveCodexRolloutsAsyncImpl() {
+  if (probeDisabledByEnv() || process.platform === "win32" || isInsideContainer()) {
+    return { available: false, paths: new Set() };
+  }
+
+  let psOut;
+  try {
+    psOut = (
+      await execFileAsync("ps", ["-Ao", "pid=,args="], {
+        encoding: "utf8",
+        timeout: 5_000,
+        maxBuffer: 16 * 1024 * 1024,
+      })
+    ).stdout;
+  } catch {
+    return { available: false, paths: new Set() };
+  }
+  const pids = [];
+  for (const line of psOut.split("\n")) {
+    const match = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (match && isCodexCommand(match[2])) pids.push(match[1]);
+  }
+  const paths = new Set();
+  if (pids.length === 0) return { available: true, paths };
+
+  const remember = (candidate) => {
+    if (typeof candidate !== "string") return;
+    if (!candidate.endsWith(".jsonl") || !path.basename(candidate).startsWith("rollout-")) return;
+    paths.add(path.resolve(candidate));
+  };
+
+  if (process.platform === "linux") {
+    for (const pid of pids) {
+      let descriptors;
+      try {
+        descriptors = await fs.promises.readdir(`/proc/${pid}/fd`);
+      } catch {
+        return { available: false, paths: new Set() };
+      }
+      for (const descriptor of descriptors) {
+        try {
+          remember(await fs.promises.readlink(`/proc/${pid}/fd/${descriptor}`));
+        } catch {
+          return { available: false, paths: new Set() };
+        }
+      }
+    }
+    return { available: true, paths };
+  }
+
+  let lsofOut;
+  try {
+    lsofOut = (
+      await execFileAsync("lsof", ["-a", "-p", pids.join(","), "-Fn"], {
+        encoding: "utf8",
+        timeout: 10_000,
+        maxBuffer: 32 * 1024 * 1024,
+      })
+    ).stdout;
+  } catch {
+    return { available: false, paths: new Set() };
+  }
+  const observedPids = new Set(
+    lsofOut
+      .split("\n")
+      .filter((line) => /^p\d+$/.test(line))
+      .map((line) => line.slice(1))
+  );
+  if (pids.some((pid) => !observedPids.has(pid))) return { available: false, paths: new Set() };
+  for (const line of lsofOut.split("\n")) {
+    if (line.startsWith("n")) remember(line.slice(1));
+  }
+  return { available: true, paths };
+}
+
 module.exports = {
   probeLiveCwds,
+  probeLiveCwdsAsync,
+  probeLiveCodexRolloutsAsync,
   probeLiveCodexRollouts,
   isAgentCommand,
   isClaudeCommand,

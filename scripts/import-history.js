@@ -886,32 +886,70 @@ function subagentTokenRows(tokensByModel) {
   return rows;
 }
 
+function isNativeLocalClaudeSession(session) {
+  if (!session || (session.provider || "claude") !== "claude") return false;
+  if (session.source && session.source !== "local") return false;
+  if (!session.metadata) return true;
+  try {
+    const meta = JSON.parse(session.metadata);
+    return (
+      !!meta &&
+      typeof meta === "object" &&
+      !Array.isArray(meta) &&
+      !Object.hasOwn(meta, "origin_host")
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Import a parsed subagent from its own JSONL file into the agents + events tables.
- * Idempotent: re-running on an already-imported subagent backfills any tool events
- * that are missing without duplicating the agent row.
- *
- * If a live subagent (created via PreToolUse "Agent" hook) matches this JSONL,
- * tool events are emitted under the live subagent's id and no JSONL-keyed row
- * is created. Otherwise, a JSONL-keyed row is created (for backfill of historical
- * sessions that never went through hooks).
- *
- * Returns the count of newly created records (agent + events).
+ * Import a parsed subagent, merging a matched hook row or creating a JSONL row,
+ * and idempotently repairing missing tool/spawn events. Returns newly created
+ * agent/event records. Boot repair uses metadataOnly to update only an existing
+ * native local target missing tokens, returning the number of metadata rows
+ * changed (0 or 1), without creating agents/events or writing session tokens.
  */
-function importSubagentFromJsonl(dbModule, sessionId, mainAgentId, subData) {
+function importSubagentFromJsonl(dbModule, sessionId, mainAgentId, subData, options = {}) {
+  const apply = () => writeSubagentFromJsonl(dbModule, sessionId, mainAgentId, subData, options);
+  // Recheck ownership and the target after parsing in the write transaction.
+  return options.metadataOnly ? dbModule.db.transaction(apply)() : apply();
+}
+
+function writeSubagentFromJsonl(dbModule, sessionId, mainAgentId, subData, options) {
   if (!subData) return 0;
   const { db, stmts } = dbModule;
+  if (options.metadataOnly && !isNativeLocalClaudeSession(stmts.getSession.get(sessionId)))
+    return 0;
 
   const jsonlSubId = `${sessionId}-jsonl-${subData.agentId}`;
   const liveSub = findLiveSubagentForJsonl(dbModule, sessionId, subData);
   const targetAgentId = liveSub ? liveSub.id : jsonlSubId;
   const existingJsonl = stmts.getAgent.get(jsonlSubId);
+  if (options.metadataOnly) {
+    const target = stmts.getAgent.get(targetAgentId);
+    if (
+      !target ||
+      target.session_id !== sessionId ||
+      target.type !== "subagent" ||
+      target.subagent_type === "compaction"
+    )
+      return 0;
+    try {
+      const meta = target.metadata ? JSON.parse(target.metadata) : {};
+      if (!meta || typeof meta !== "object" || Array.isArray(meta) || Object.hasOwn(meta, "tokens"))
+        return 0;
+    } catch {
+      return 0;
+    }
+  }
 
   const subName = subData.agentType ? subData.agentType : `Subagent ${subData.agentId.slice(0, 8)}`;
   // This subagent's OWN token usage, so the UI can price it independently of the
   // session total (which would otherwise be shown on every card, misleadingly).
   const tokenRows = subagentTokenRows(subData.tokensByModel);
   let created = 0;
+  let metadataChanged = false;
 
   // Only create a JSONL-keyed row when there's no live subagent to merge into.
   // Live subagents (created via the PreToolUse "Agent" hook) are detected by
@@ -1008,9 +1046,13 @@ function importSubagentFromJsonl(dbModule, sessionId, mainAgentId, subData) {
           JSON.stringify(meta),
           targetAgentId
         );
+        metadataChanged = true;
       }
     }
   }
+
+  // Boot repair fills metadata only; full imports still repair events below.
+  if (options.metadataOnly) return metadataChanged ? 1 : 0;
 
   // Subagent token totals are written under the subagent's OWN model — live by
   // scanAndImportSubagents() (per-subagent buckets, excluding the parent model)
@@ -2876,10 +2918,11 @@ async function scanAndImportSubagents(dbModule, sessionId, transcriptPath, opts 
  * the subagent transcripts for any session that still has a non-compaction
  * subagent missing the tokens key and stamps them.
  *
- * METADATA ONLY — it routes through importSubagentFromJsonl, which stamps the
- * agent row's metadata (and idempotently backfills any missing spawn/tool
- * events) but never writes session token_usage. So session cost totals are
- * completely untouched; only the per-agent breakdown is filled in.
+ * METADATA ONLY — the boot repair updates existing native local Claude
+ * subagents, without creating agents or replaying events. Archived remote
+ * histories retain origin_host and are excluded even if their source is local.
+ * Ordinary imports still repair missing spawn/tool events. Session token_usage
+ * is never written by this boot repair.
  *
  * Idempotent and self-limiting: once a row has a tokens key it drops out of the
  * driving query, so steady-state startups do near-zero work.
@@ -2898,6 +2941,8 @@ async function backfillSubagentTokenMetadata(dbModule) {
                 s.metadata AS meta
          FROM agents a JOIN sessions s ON s.id = a.session_id
          WHERE a.type = 'subagent'
+           AND COALESCE(s.provider, 'claude') = 'claude'
+           AND COALESCE(s.source, 'local') = 'local'
            AND (a.subagent_type IS NULL OR a.subagent_type != 'compaction')
            AND (a.metadata IS NULL OR a.metadata NOT LIKE '%"tokens":%')`
       )
@@ -2908,6 +2953,7 @@ async function backfillSubagentTokenMetadata(dbModule) {
   let stamped = 0;
   let scanned = 0;
   for (const s of sessions) {
+    if (!isNativeLocalClaudeSession(dbModule.stmts.getSession.get(s.session_id))) continue;
     // Resolve the session transcript path: prefer the stored column when the
     // file still exists, else derive it from the projects dir + slug (imported
     // sessions leave transcript_path NULL). findSessionSubagents then covers
@@ -2942,11 +2988,13 @@ async function backfillSubagentTokenMetadata(dbModule) {
       try {
         const subData = await parseSubagentFile(file);
         if (!subData) continue;
-        importSubagentFromJsonl(dbModule, s.session_id, mainAgentId, subData);
-        stamped++;
+        stamped += importSubagentFromJsonl(dbModule, s.session_id, mainAgentId, subData, {
+          metadataOnly: true,
+        });
       } catch {
         /* non-fatal — partial or unrelated files are common */
       }
+      await new Promise((resolve) => setImmediate(resolve));
     }
   }
   return { sessions: scanned, stamped };

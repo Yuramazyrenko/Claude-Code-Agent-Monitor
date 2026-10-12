@@ -14,8 +14,8 @@
 const { DatabaseSync } = require("node:sqlite");
 
 class Database {
-  constructor(filePath) {
-    this._db = new DatabaseSync(filePath);
+  constructor(filePath, options = {}) {
+    this._db = new DatabaseSync(filePath, { readOnly: !!options.readonly });
     this._savepointSequence = 0;
   }
 

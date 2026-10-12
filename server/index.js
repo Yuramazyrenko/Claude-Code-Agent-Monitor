@@ -156,6 +156,23 @@ function createApp() {
     res.json({ status: "ok", version: APP_VERSION, timestamp: new Date().toISOString() });
   });
 
+  // Keep async API failures machine-readable without exposing SQL or stacks.
+  app.use("/api", (error, _req, res, next) => {
+    if (res.headersSent) return next(error);
+    const requested = error?.status ?? error?.statusCode;
+    const status =
+      Number.isInteger(requested) && requested >= 400 && requested < 600 ? requested : 500;
+    const code =
+      status === 503 ? "SERVICE_UNAVAILABLE" : status >= 500 ? "INTERNAL_ERROR" : "REQUEST_FAILED";
+    const message =
+      status === 503
+        ? "Data temporarily unavailable"
+        : status >= 500
+          ? "Internal server error"
+          : "Request failed";
+    res.status(status).json({ error: { code, message } });
+  });
+
   return app;
 }
 
@@ -432,11 +449,11 @@ function startBackgroundServices() {
   // exists to protect long-running steady-state work on watchdog ticks, and
   // there is no in-flight work at boot).
   {
-    const bootReap = (label) => {
+    const bootReap = async (label) => {
       try {
-        const { livenessReap } = require("./routes/hooks");
-        livenessReap({ ignoreIdleGate: true });
-        livenessReap({ ignoreIdleGate: true, provider: "codex" });
+        const { livenessReapAsync } = require("./routes/hooks");
+        await livenessReapAsync({ ignoreIdleGate: true });
+        await livenessReapAsync({ ignoreIdleGate: true, provider: "codex" });
       } catch (err) {
         console.warn(`${label} liveness reap failed:`, err?.message || err);
       }
@@ -875,6 +892,28 @@ function createIngestRetryBudget(maxAttempts) {
   };
 }
 
+// Negative process evidence is valid only for files observed before the census
+// and while the DB has not changed. Positive evidence remains conservative.
+// A busy collector may defer absence decisions to the next watchdog census.
+function createCodexProbeFence(transcripts, db) {
+  const fs = require("node:fs");
+  const { databaseGeneration } = require("./lib/readonly-query");
+  const signature = (stat) => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+  const before = new Map();
+  for (const file of transcripts) {
+    try {
+      before.set(file, signature(fs.statSync(file)));
+    } catch {}
+  }
+  const generation = databaseGeneration(db);
+  return (probe, file, stat) => {
+    if (!probe.available) return null;
+    if (probe.paths.has(path.resolve(file))) return probe.paths;
+    if (before.get(file) !== signature(stat) || databaseGeneration(db) !== generation) return null;
+    return probe.paths;
+  };
+}
+
 function startCodexSessionSync(broadcast) {
   const fs = require("fs");
   const { getCodexHome, getCodexSessionsDir, onCodexHomeChanged } = require("./lib/codex-home");
@@ -939,8 +978,9 @@ function startCodexSessionSync(broadcast) {
       // as soon as Codex creates the directory instead of polling forever.
       watchSessionsDir();
       watchCodexHome();
-      const rolloutProbe = liveness.probeLiveCodexRollouts();
-      const liveTranscripts = rolloutProbe.available ? rolloutProbe.paths : null;
+      const transcripts = findCodexTranscripts(sessionsDir);
+      const selectLiveTranscripts = createCodexProbeFence(transcripts, require("./db").db);
+      const rolloutProbe = await liveness.probeLiveCodexRolloutsAsync();
       // Hooks are the lowest-latency signal, but Codex may delay a new hook
       // until the user approves it. Its local thread row is written at CLI
       // launch, so use it to create the same Waiting card immediately.
@@ -949,7 +989,6 @@ function startCodexSessionSync(broadcast) {
       // rollout line. Refresh those titles before evaluating transcript bytes
       // so cards change in real time even for an otherwise idle session.
       for (const result of refreshCodexSessionTitles()) publish(result);
-      const transcripts = findCodexTranscripts(sessionsDir);
       for (let index = 0; index < transcripts.length; index++) {
         const transcriptPath = transcripts[index];
         let stat;
@@ -970,7 +1009,9 @@ function startCodexSessionSync(broadcast) {
             // error, and an I/O error the ingestor swallows and reports as
             // `failed` (it returns `{changed:false}` for legitimate no-ops too,
             // so the flag is the only way to tell them apart).
-            const ingestResult = ingestCodexTranscript(transcriptPath, { liveTranscripts });
+            const ingestResult = ingestCodexTranscript(transcriptPath, {
+              liveTranscripts: selectLiveTranscripts(rolloutProbe, transcriptPath, stat),
+            });
             publish(ingestResult);
             if (ingestResult?.failed) {
               noteIngestFailure(
@@ -1647,5 +1688,6 @@ module.exports = {
   startCursorSessionSync,
   codexHomeChangeTriggersSweep,
   createIngestRetryBudget,
+  createCodexProbeFence,
   repairInflatedTokenTotals,
 };
