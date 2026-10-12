@@ -16,6 +16,13 @@ const { DatabaseSync } = require("node:sqlite");
 class Database {
   constructor(filePath) {
     this._db = new DatabaseSync(filePath);
+    this._savepointSequence = 0;
+  }
+
+  // Unknown state stays unknown so transaction-sensitive readers fail closed.
+  get inTransaction() {
+    const state = this._db.isTransaction;
+    return typeof state === "boolean" ? state : undefined;
   }
 
   exec(sql) {
@@ -42,13 +49,23 @@ class Database {
   transaction(fn) {
     const db = this._db;
     const wrapper = (...args) => {
-      db.exec("BEGIN");
+      const nested = this.inTransaction;
+      if (nested === undefined) throw new Error("SQLite transaction state is unavailable");
+      const savepoint = `ccam_compat_${++this._savepointSequence}`;
+      db.exec(nested ? `SAVEPOINT ${savepoint}` : "BEGIN");
       try {
         const result = fn(...args);
-        db.exec("COMMIT");
+        db.exec(nested ? `RELEASE ${savepoint}` : "COMMIT");
         return result;
       } catch (err) {
-        db.exec("ROLLBACK");
+        if (db.isTransaction) {
+          if (nested) {
+            db.exec(`ROLLBACK TO ${savepoint}`);
+            db.exec(`RELEASE ${savepoint}`);
+          } else {
+            db.exec("ROLLBACK");
+          }
+        }
         throw err;
       }
     };
