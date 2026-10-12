@@ -2734,7 +2734,7 @@ The desktop app is a fourth deployment mode alongside Development, Production, a
 
 ## Security Considerations
 
-Remote history import checks both source ownership and provider before writing matching native session IDs. Claude checks are repeated after asynchronous transcript/workflow parsing, and failed session transactions do not publish snapshots. Codex validates filename/metadata identity and both primary/tool cursor IDs. New remote rows record source and `metadata.origin_host` atomically. The existing sync transport and timer remain unchanged; exclusions are reported through `sessions_excluded`, `subagent_files_excluded`, and up to 50 `excluded_ids`.
+Remote history import checks both source ownership and provider before writing matching native session IDs. Claude checks are repeated after asynchronous transcript/workflow parsing, and failed session transactions do not publish snapshots. Codex validates filename/metadata identity and both primary/tool cursor IDs. New remote rows record source and `metadata.origin_host` atomically. OpenSSH transfers write an unpublished generation, retain the previous complete staging tree on failure, and publish only while the original stored source configuration still matches. Directory publication has a recoverable two-rename boundary; it is not a filesystem-wide atomic swap. SCP preserves mtimes with `-p`; partial SCP bytes are not resumed. The sync timer remains unchanged; exclusions are reported through `sessions_excluded`, `subagent_files_excluded`, and up to 50 `excluded_ids`.
 
 | Area                   | Approach                                                                                                                                                   |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -3052,4 +3052,4 @@ make docker-down    Stop docker-compose stack
 
 See `Makefile` for the complete set of 30 targets covering setup, dev, testing, formatting, MCP, data management, Codex extensions, and Docker/Podman workflows.
 
-Nested import transactions use savepoints under both SQLite backends.
+Nested import transactions use savepoints under both SQLite backends. Configuration edits clear obsolete remote-sync activity without replacing the last successful history receipt.

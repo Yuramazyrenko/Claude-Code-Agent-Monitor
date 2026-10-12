@@ -700,6 +700,7 @@ function startCursorSessionSync(broadcast, options = {}) {
  * shutdown; overlapping ticks queue one follow-up sweep (same as local sync).
  */
 function startRemoteSourceSync(broadcast) {
+  require("./lib/remote-sync").recoverInterruptedSyncs(require("./db"));
   const POLL_MS = process.env.DASHBOARD_REMOTE_SYNC_MS
     ? Number(process.env.DASHBOARD_REMOTE_SYNC_MS)
     : 15_000;
