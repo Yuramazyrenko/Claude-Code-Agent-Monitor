@@ -893,12 +893,21 @@ function createCodexProbeFence(transcripts, db, observations) {
       if (stat) before.set(file, signature(stat));
     } catch {}
   }
-  let expected = databaseGeneration(db);
+  // The generation is this connection's total_changes() followed by parts that
+  // only other connections move (data_version). Only the first can be ours.
+  const split = () => {
+    const generation = databaseGeneration(db);
+    const at = generation.indexOf(":");
+    return { local: generation.slice(0, at), external: generation.slice(at + 1) };
+  };
+  const baseline = split();
+  let expectedLocal = baseline.local;
   let changedElsewhere = false;
-  // Any change not made inside ownWrites (a hook, a new session, another
-  // process) arrived while the sweep was awaiting; it voids the census.
+  // Any change not made inside ownWrites (a hook, a new session) or made by
+  // another process at any time voids the remaining census.
   const settle = () => {
-    if (databaseGeneration(db) !== expected) changedElsewhere = true;
+    const now = split();
+    if (now.local !== expectedLocal || now.external !== baseline.external) changedElsewhere = true;
   };
   const select = (probe, file, stat) => {
     if (!probe.available) return null;
@@ -908,13 +917,14 @@ function createCodexProbeFence(transcripts, db, observations) {
     return probe.paths;
   };
   // The sweep's own synchronous writes cannot interleave with hooks or other
-  // callbacks, so they are absorbed instead of voiding the remaining census.
+  // callbacks, so this connection's changes during them are absorbed; a commit
+  // by another process during them is still seen through data_version.
   select.ownWrites = (write) => {
     settle();
     try {
       return write();
     } finally {
-      expected = databaseGeneration(db);
+      expectedLocal = split().local;
     }
   };
   return select;
