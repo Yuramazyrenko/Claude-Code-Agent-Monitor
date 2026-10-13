@@ -870,8 +870,9 @@ function createIngestRetryBudget(maxAttempts) {
 }
 
 // Negative process evidence is valid only for files observed before the census
-// and while the DB has not changed. Positive evidence remains conservative.
-// A busy collector may defer absence decisions to the next watchdog census.
+// and while nothing but the sweep itself has changed the DB. Positive evidence
+// remains conservative. A busy collector may defer absence decisions to the
+// next watchdog census.
 function createCodexProbeFence(transcripts, db) {
   const fs = require("node:fs");
   const { databaseGeneration } = require("./lib/readonly-query");
@@ -882,13 +883,31 @@ function createCodexProbeFence(transcripts, db) {
       before.set(file, signature(fs.statSync(file)));
     } catch {}
   }
-  const generation = databaseGeneration(db);
-  return (probe, file, stat) => {
+  let expected = databaseGeneration(db);
+  let changedElsewhere = false;
+  // Any change not made inside ownWrites (a hook, a new session, another
+  // process) arrived while the sweep was awaiting; it voids the census.
+  const settle = () => {
+    if (databaseGeneration(db) !== expected) changedElsewhere = true;
+  };
+  const select = (probe, file, stat) => {
     if (!probe.available) return null;
     if (probe.paths.has(path.resolve(file))) return probe.paths;
-    if (before.get(file) !== signature(stat) || databaseGeneration(db) !== generation) return null;
+    settle();
+    if (changedElsewhere || before.get(file) !== signature(stat)) return null;
     return probe.paths;
   };
+  // The sweep's own synchronous writes cannot interleave with hooks or other
+  // callbacks, so they are absorbed instead of voiding the remaining census.
+  select.ownWrites = (write) => {
+    settle();
+    try {
+      return write();
+    } finally {
+      expected = databaseGeneration(db);
+    }
+  };
+  return select;
 }
 
 /**
@@ -970,11 +989,12 @@ function startCodexSessionSync(broadcast) {
       // Hooks are the lowest-latency signal, but Codex may delay a new hook
       // until the user approves it. Its local thread row is written at CLI
       // launch, so use it to create the same Waiting card immediately.
-      for (const result of syncCodexStateSessions()) publish(result);
+      for (const result of selectLiveTranscripts.ownWrites(syncCodexStateSessions)) publish(result);
       // `/rename` updates Codex's root-level session index instead of adding a
       // rollout line. Refresh those titles before evaluating transcript bytes
       // so cards change in real time even for an otherwise idle session.
-      for (const result of refreshCodexSessionTitles()) publish(result);
+      for (const result of selectLiveTranscripts.ownWrites(refreshCodexSessionTitles))
+        publish(result);
       for (let index = 0; index < transcripts.length; index++) {
         const transcriptPath = transcripts[index];
         let stat;
@@ -995,9 +1015,11 @@ function startCodexSessionSync(broadcast) {
             // error, and an I/O error the ingestor swallows and reports as
             // `failed` (it returns `{changed:false}` for legitimate no-ops too,
             // so the flag is the only way to tell them apart).
-            const ingestResult = ingestCodexTranscript(transcriptPath, {
-              liveTranscripts: selectLiveTranscripts(rolloutProbe, transcriptPath, stat),
-            });
+            const ingestResult = selectLiveTranscripts.ownWrites(() =>
+              ingestCodexTranscript(transcriptPath, {
+                liveTranscripts: selectLiveTranscripts(rolloutProbe, transcriptPath, stat),
+              })
+            );
             publish(ingestResult);
             if (ingestResult?.failed) {
               noteIngestFailure(
@@ -1044,7 +1066,9 @@ function startCodexSessionSync(broadcast) {
             // too, so the flag is the only way to tell them apart — without it
             // a transient read error would clear the marker and the file's
             // tool calls would stay unindexed until it next grew).
-            const toolResult = ingestCodexToolEvents(transcriptPath);
+            const toolResult = selectLiveTranscripts.ownWrites(() =>
+              ingestCodexToolEvents(transcriptPath)
+            );
             publish(toolResult);
             if (toolResult?.failed) {
               toolIngestFailed.add(transcriptPath);
