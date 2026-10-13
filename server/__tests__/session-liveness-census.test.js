@@ -20,6 +20,7 @@ const rollout = path.join(root, "rollout-2026-10-13T00-00-00-census.jsonl");
 const savedPath = process.env.PATH;
 const savedProbe = process.env.DASHBOARD_LIVENESS_PROBE;
 let rolloutFd;
+const uid = typeof process.getuid === "function" ? process.getuid() : 0;
 let unreadable;
 
 before(() => {
@@ -62,7 +63,7 @@ function exitedPid() {
 
 it("a process that exited before its cwd was read does not void the census", { skip }, async () => {
   const gone = exitedPid();
-  process.env.CENSUS_PS = `${process.pid} claude --resume\n${gone} claude\n`;
+  process.env.CENSUS_PS = `${process.pid} ${uid} claude --resume\n${gone} ${uid} claude\n`;
   const result = await liveness.probeLiveCwdsAsync("claude");
   assert.equal(result.available, true);
   assert.ok(result.cwds.has(path.resolve(process.cwd())));
@@ -73,7 +74,7 @@ it(
   { skip },
   async () => {
     const gone = exitedPid();
-    process.env.CENSUS_PS = `${process.pid} codex resume\n${gone} codex\n`;
+    process.env.CENSUS_PS = `${process.pid} ${uid} codex resume\n${gone} ${uid} codex\n`;
     const result = await liveness.probeLiveCodexRolloutsAsync();
     assert.equal(result.available, true);
     assert.ok(result.paths.has(fs.realpathSync(rollout)) || result.paths.has(rollout));
@@ -85,9 +86,9 @@ it(
   { skip: skip || (process.platform === "linux" && "Linux reads /proc, not lsof") },
   async () => {
     unreadable = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"]);
-    process.env.CENSUS_PS = `${process.pid} claude\n${unreadable.pid} claude\n`;
+    process.env.CENSUS_PS = `${process.pid} ${uid} claude\n${unreadable.pid} ${uid} claude\n`;
     assert.equal((await liveness.probeLiveCwdsAsync("claude")).available, false);
-    process.env.CENSUS_PS = `${process.pid} codex\n${unreadable.pid} codex\n`;
+    process.env.CENSUS_PS = `${process.pid} ${uid} codex\n${unreadable.pid} ${uid} codex\n`;
     assert.equal((await liveness.probeLiveCodexRolloutsAsync()).available, false);
   }
 );

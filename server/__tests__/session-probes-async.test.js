@@ -18,6 +18,8 @@ function fixture({
   missingPid = false,
   missingCwd = false,
   gone = [],
+  uid = null,
+  foreign = false,
 } = {}) {
   const calls = [];
   const exec = () => {
@@ -26,7 +28,12 @@ function fixture({
   exec[promisify.custom] = async (command, args, options) => {
     calls.push({ command, args, options });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    if (command === "ps") return { stdout: "42 /bin/claude\n43 /bin/codex\n" };
+    if (command === "ps")
+      return {
+        stdout:
+          "42 501 /bin/claude\n43 501 /bin/codex\n" +
+          (foreign ? "44 777 /bin/claude\n45 777 /bin/codex\n" : ""),
+      };
     if (failure) throw Object.assign(new Error("census failed"), failure);
     if (missingPid) return { stdout: "p99\nn/tmp/unrelated\n" };
     if (missingCwd && args.includes("cwd")) return { stdout: "p42\nfcwd\n" };
@@ -53,6 +60,7 @@ function fixture({
     process: {
       platform,
       env: { DASHBOARD_LIVENESS_PROBE: disabled ? "0" : "1" },
+      ...(uid === null ? {} : { getuid: () => uid }),
       kill: (pid) => {
         if (gone.includes(String(pid))) throw Object.assign(new Error("gone"), { code: "ESRCH" });
         return true;
@@ -119,6 +127,15 @@ it("an lsof exit explained by processes that already exited keeps the census", a
     assert.equal((await probe.probeLiveCwdsAsync()).available, false);
     assert.equal((await probe.probeLiveCodexRolloutsAsync()).available, false);
   }
+});
+it("another user's agent processes do not make the census incomplete", async () => {
+  const { probe, calls } = fixture({ uid: 501, foreign: true });
+  const cwds = await probe.probeLiveCwdsAsync();
+  assert.equal(cwds.available, true);
+  assert.deepEqual([...cwds.cwds], ["/tmp/provider"]);
+  assert.equal((await probe.probeLiveCodexRolloutsAsync()).available, true);
+  for (const call of calls.filter((c) => c.command === "lsof"))
+    assert.doesNotMatch(call.args.join(" "), /44|45/);
 });
 it("unsupported hosts and the escape hatch never run OS commands", async () => {
   for (const options of [{ platform: "win32" }, { disabled: true }]) {
