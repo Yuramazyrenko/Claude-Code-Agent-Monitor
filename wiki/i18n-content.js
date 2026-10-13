@@ -7835,7 +7835,7 @@ Object.assign(window.__WIKI_CONTENT_I18N.zh, {
 });
 Object.assign(window.__WIKI_CONTENT_I18N.vi, {
   "Preview Codex output repair without changing data. Stop the dashboard before applying with <code>--apply --journal new-backup.json</code>. Existing files are never overwritten; ambiguous histories are preserved. Plain, gzip and Zstd prefixes are streamed.":
-    "Xem trước việc sửa lượng đầu ra Codex mà không đổi dữ liệu. Dừng dashboard trước khi áp dụng <code>--apply --journal new-backup.json</code>. Không ghi đè tệp có sẵn; giữ nguyên lịch sử chưa xác minh. Đọc phần đầu bản ghi thường, gzip và Zstd theo luồng.",
+    "Xem trước việc sửa lượng đầu ra Codex mà không đổi dữ liệu. Dừng dashboard trước khi áp dụng <code>--apply --journal new-backup.json</code>. Không ghi đè tệp có sẵn; giữ nguyên lịch sử mơ hồ. Đọc phần đầu bản ghi thường, gzip và Zstd theo luồng.",
 });
 Object.assign(window.__WIKI_CONTENT_I18N.ko, {
   "Preview Codex output repair without changing data. Stop the dashboard before applying with <code>--apply --journal new-backup.json</code>. Existing files are never overwritten; ambiguous histories are preserved. Plain, gzip and Zstd prefixes are streamed.":

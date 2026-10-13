@@ -1370,7 +1370,7 @@ The client is a production-ready React application with:
 
 For server documentation, see [server/README.md](../server/README.md).
 
-**Cost coverage:** Dashboard and Settings show exact USD cents, the current source/product scope, and rate-coverage warnings through `components/CostCoverage.tsx`. These are API-equivalent estimates, not subscription bills. Dashboard reloads share one pending request per scope; obsolete scope/unmount responses cannot publish values. A completed remote import during a pending load queues one fresh follow-up after it settles.
+**Cost coverage:** Dashboard and Settings show unabbreviated USD estimates rounded to the cent, the current source/product scope, and rate-coverage warnings through `components/CostCoverage.tsx`. These are API-equivalent estimates, not subscription bills. Dashboard reloads share one pending request per scope; obsolete scope/unmount responses cannot publish values. A completed remote import during a pending load queues one fresh follow-up after it settles.
 
 Remote retries preserve `last_error` and the status-message `error` field while checking. Settings labels it as the last error during retry; a successful sync clears the diagnostic. Previously imported rows and the last successful receipt remain available when transport fails.
 
