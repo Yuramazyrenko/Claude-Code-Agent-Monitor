@@ -16,7 +16,14 @@ process.env.DASHBOARD_CURSOR_HOME = path.join(root, "cursor");
 process.env.DASHBOARD_DATA_DIR = root;
 process.env.DASHBOARD_DB_PATH = path.join(root, "base.db");
 const { db, seedGptPricing } = require("../db");
-const Database = require("better-sqlite3");
+// better-sqlite3 is optional; fall back to the built-in adapter as the app does.
+let Database;
+try {
+  Database = require("better-sqlite3");
+  new Database(":memory:").close();
+} catch {
+  Database = require("../compat-sqlite");
+}
 const { calculateGptCost } = require("../routes/pricing");
 const {
   planRepair,
@@ -218,6 +225,20 @@ it("failed directory durability refuses all repair writes", async (t) => {
   } finally {
     d.close();
   }
+});
+it("a preview plan is written without the directory flush that repair writes need", (t) => {
+  const original = fs.fsyncSync;
+  t.mock.method(fs, "fsyncSync", (fd) => {
+    if (fs.fstatSync(fd).isDirectory()) throw new Error("directory durability failed");
+    return original(fd);
+  });
+  const plan = path.join(root, "preview-plan.json");
+  writeExclusive(plan, "{}\n", { syncDirectory: false });
+  assert.equal(fs.readFileSync(plan, "utf8"), "{}\n");
+  assert.throws(
+    () => writeExclusive(path.join(root, "receipt.json"), "{}\n"),
+    /directory durability failed/
+  );
 });
 function legacy(d, id, compressed = false) {
   const file = path.join(root, id + ".jsonl");
