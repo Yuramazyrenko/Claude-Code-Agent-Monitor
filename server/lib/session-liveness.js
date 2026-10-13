@@ -350,7 +350,8 @@ async function probeLiveCodexRolloutsAsyncImpl() {
         try {
           remember(await fs.promises.readlink(`/proc/${pid}/fd/${descriptor}`));
         } catch (error) {
-          // A descriptor closed after readdir held nothing at census time.
+          // A descriptor closed between readdir and readlink is skipped: the file
+          // it held is no longer open, so it cannot prove the session live.
           if (error?.code === "ENOENT" || processGone(pid)) continue;
           return { available: false, paths: new Set() };
         }

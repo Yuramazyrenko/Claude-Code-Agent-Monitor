@@ -883,8 +883,9 @@ function createCodexProbeFence(transcripts, db) {
       before.set(file, signature(fs.statSync(file)));
     } catch {}
   }
-  // The generation is this connection's total_changes() followed by parts that
-  // only other connections move (data_version). Only the first can be ours.
+  // The generation is this connection's total_changes() followed by parts the
+  // sweep's own writes never move (data_version, which only other connections
+  // advance; schema_version where present, which only DDL advances).
   const split = () => {
     const generation = databaseGeneration(db);
     const at = generation.indexOf(":");
