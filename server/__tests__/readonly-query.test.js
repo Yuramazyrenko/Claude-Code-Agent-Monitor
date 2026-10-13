@@ -93,36 +93,76 @@ for (const [driver, Constructor] of [
   );
 }
 
-it(
-  "an oversized row page fails within the worker budget and a later read recovers",
-  { timeout: 30000, skip: !Native },
-  async () => {
-    const { file, db } = fixture(Native);
-    const reader = new ReadonlyQuery(file, { driver: "native" });
-    try {
-      const large = reader.read({
-        op: "all",
-        sql: `SELECT printf('%.*c', 160000, 'x') AS data
-      FROM (WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<500) SELECT i FROM n)`,
-      });
-      const started = once(reader, "started");
-      await started;
-      const queued = reader.read({ op: "get", sql: "SELECT 1 AS queued" });
-      const results = await Promise.allSettled([large, queued]);
-      for (const result of results) {
-        assert.equal(result.status, "rejected");
-        assert.equal(result.reason.status, 503);
-        assert.match(result.reason.message, /memory|reader/i);
+for (const [driver, Constructor] of [
+  ["native", Native],
+  ["compat", Compat],
+]) {
+  it(
+    `${driver}: a read that exhausts the worker heap fails alone and queued reads continue`,
+    { timeout: 30000, skip: !Constructor },
+    async () => {
+      const { file, db } = fixture(Constructor);
+      const reader = new ReadonlyQuery(file, { driver });
+      try {
+        const large = reader.read({
+          op: "all",
+          sql: `SELECT printf('%.*c', 160000, 'x') AS data
+        FROM (WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<500) SELECT i FROM n)`,
+        });
+        await once(reader, "started");
+        const queued = reader.read({ op: "get", sql: "SELECT 1 AS queued" });
+        const [failed, served] = await Promise.allSettled([large, queued]);
+        assert.equal(failed.status, "rejected");
+        assert.equal(failed.reason.status, 503);
+        assert.equal(failed.reason.cause.code, "ERR_WORKER_OUT_OF_MEMORY");
+        assert.deepEqual(served, { status: "fulfilled", value: { queued: 1 } });
+        assert.equal(reader.pending.size, 0);
+        assert.equal((await reader.read(query)).count, 3);
+      } finally {
+        await reader.close();
+        db.close();
       }
-      assert.equal(reader.pending.size, 0);
-      if (reader.terminating) await reader.terminating;
-      assert.equal((await reader.read(query)).count, 3);
-    } finally {
-      await reader.close();
-      db.close();
     }
-  }
-);
+  );
+
+  it(
+    `${driver}: an event page over the byte budget is reported without materializing rows`,
+    { timeout: 30000, skip: !Constructor },
+    async () => {
+      const { file, db } = fixture(Constructor);
+      const reader = new ReadonlyQuery(file, { driver, eventPageBudgetBytes: 250000 });
+      const page = (width) => {
+        const sql = `SELECT id, session_id, printf('%.*c', ${width}, 'x') AS data FROM events ORDER BY id DESC`;
+        return {
+          sql,
+          sizeSql: `SELECT id, length(CAST(data AS BLOB)) AS bytes FROM (${sql})`,
+          fetchSql: "SELECT * FROM events WHERE id IN (SELECT value FROM json_each(?))",
+        };
+      };
+      const count = { sql: "SELECT COUNT(*) AS count FROM events" };
+      try {
+        const over = reader.read({ op: "eventPage", page: page(100000), count });
+        const queued = reader.read(query);
+        assert.deepEqual(await over, { overflow: true });
+        assert.equal((await queued).count, 3);
+        const worker = reader.worker;
+        const under = await reader.read({ op: "eventPage", page: page(10), count });
+        assert.equal(reader.worker, worker, "the same worker serves the next read");
+        assert.deepEqual(
+          under.events.map((row) => ({ ...row })),
+          db
+            .prepare("SELECT * FROM events ORDER BY id DESC")
+            .all()
+            .map((row) => ({ ...row }))
+        );
+        assert.equal(under.total, 3);
+      } finally {
+        await reader.close();
+        db.close();
+      }
+    }
+  );
+}
 
 function fixture(Constructor, slow = false) {
   const file = path.join(root, `${++sequence}.db`);
