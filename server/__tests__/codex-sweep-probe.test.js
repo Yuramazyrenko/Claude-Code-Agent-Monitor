@@ -104,6 +104,25 @@ it("activity between the sweep's own writes still voids the remaining census", a
     "active"
   );
 });
+it("another process committing during the sweep's own write still voids the census", async () => {
+  const { DatabaseSync } = require("node:sqlite");
+  const first = fixture();
+  const second = fixture();
+  const other = new DatabaseSync(process.env.DASHBOARD_DB_PATH);
+  try {
+    const select = createCodexProbeFence([first.file, second.file], db);
+    await Promise.resolve();
+    select.ownWrites(() => {
+      ingestCodexTranscript(first.file, {
+        liveTranscripts: select(absent, first.file, fs.statSync(first.file)),
+      });
+      other.exec("CREATE TABLE IF NOT EXISTS other_writer(x); INSERT INTO other_writer VALUES(1)");
+    });
+    assert.equal(select(absent, second.file, fs.statSync(second.file)), null);
+  } finally {
+    other.close();
+  }
+});
 it("unobserved paths and unavailable census remain unknown, positive evidence stays safe", () => {
   const { file } = fixture();
   const select = createCodexProbeFence([], db),
