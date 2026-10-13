@@ -5257,7 +5257,7 @@ exports[`screen snapshots > Dashboard 1`] = `
             data-discover="true"
             href="/settings#remote-sources"
           >
-            Sources: All sources · Products: Both
+            Sources: All sources · Products: Claude Code
           </a>
         </p>
       </div>
@@ -7811,7 +7811,7 @@ exports[`screen snapshots > Settings 1`] = `
           data-discover="true"
           href="/settings#remote-sources"
         >
-          Sources: All sources · Products: Both
+          Sources: All sources · Products: Claude Code
         </a>
       </p>
     </div>

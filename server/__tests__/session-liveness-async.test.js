@@ -147,6 +147,20 @@ for (const [label, change] of [
       0
     );
   });
+it("a boot reap is not served by an already pending idle-gated reap", async () => {
+  const id = seed(),
+    probe = delayed();
+  const gated = hooks.livenessReapAsync();
+  const boot = hooks.livenessReapAsync({ ignoreIdleGate: true });
+  const joined = hooks.livenessReapAsync({ ignoreIdleGate: true });
+  probe.complete();
+  await Promise.all([gated, boot]);
+  assert.notEqual(boot, gated, "the boot pass bypasses the idle gate, so it runs its own census");
+  assert.equal(joined, boot);
+  assert.equal(probe.calls(), 2);
+  assert.equal(db.prepare("SELECT status FROM sessions WHERE id=?").get(id).status, "completed");
+});
+
 it("unavailable census changes nothing and a later check starts a fresh census", async () => {
   const id = seed(),
     probe = delayed();

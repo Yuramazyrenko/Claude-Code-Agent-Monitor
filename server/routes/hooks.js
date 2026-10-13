@@ -1856,7 +1856,9 @@ function livenessEpoch(session) {
 const pendingReaps = new Map();
 function livenessReapAsync(options = {}) {
   const provider = options.provider || "claude";
-  if (pendingReaps.has(provider)) return pendingReaps.get(provider);
+  // A boot pass bypasses the idle gate; it must not be served by a gated run.
+  const key = `${provider}:${options.ignoreIdleGate ? "boot" : "gated"}`;
+  if (pendingReaps.has(key)) return pendingReaps.get(key);
   const pending = (async () => {
     const candidates = livenessCandidates(provider);
     if (!candidates.length) return;
@@ -1871,8 +1873,8 @@ function livenessReapAsync(options = {}) {
     ]);
     if (!probe.available && !rollouts?.available) return;
     livenessReap({ ...options, provider, _probe: probe, _rollouts: rollouts, _before: before });
-  })().finally(() => pendingReaps.delete(provider));
-  pendingReaps.set(provider, pending);
+  })().finally(() => pendingReaps.delete(key));
+  pendingReaps.set(key, pending);
   return pending;
 }
 

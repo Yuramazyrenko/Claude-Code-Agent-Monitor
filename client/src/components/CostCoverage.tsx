@@ -18,6 +18,9 @@ export function CostCoverage({ scope, unpriced }: { scope: DataScope; unpriced: 
         ? "scopeSelected"
         : "scopeAll";
   const models = [...new Set(unpriced.map((row) => row.model))].join(", ");
+  // An unset product scope reads Claude data, so label and rate links follow it.
+  const provider = scope.provider || "claude";
+  const pricingAnchor = provider === "codex" ? "gpt-pricing" : "claude-pricing";
   return (
     <div className="text-xs text-gray-400 mb-4 space-y-1">
       <p>{t("costEstimate")}</p>
@@ -25,14 +28,14 @@ export function CostCoverage({ scope, unpriced }: { scope: DataScope; unpriced: 
         <Link className="text-accent hover:underline" to="/settings#remote-sources">
           {t("costScope", {
             sources: t(`settings:remoteSources.${scopeKey}`),
-            providers: t(`settings:display.${scope.provider || "both"}`),
+            providers: t(`settings:display.${provider}`),
           })}
         </Link>
       </p>
       {unpriced.length > 0 && (
         <p role="status" className="text-amber-400">
           {t("costIncomplete", { models })}{" "}
-          <Link className="underline" to="/settings#claude-pricing">
+          <Link className="underline" to={`/settings#${pricingAnchor}`}>
             {t("reviewRates")}
           </Link>
         </p>

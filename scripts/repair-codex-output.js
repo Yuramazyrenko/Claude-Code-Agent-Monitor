@@ -149,9 +149,6 @@ async function planRepair(db, { limit = Number.MAX_SAFE_INTEGER, sessionId = nul
     "SELECT * FROM token_usage WHERE session_id=? ORDER BY model,speed,inference_geo,service_tier,context_size"
   );
   const state = db.prepare("SELECT * FROM codex_ingest_state WHERE transcript_path=?");
-  const maxEvent = db.prepare(
-    "SELECT MAX(id) AS id FROM events WHERE session_id=? AND event_type='codex_token_count'"
-  );
   const entries = [],
     skipped = [];
   let unchanged = 0;
@@ -193,20 +190,6 @@ async function planRepair(db, { limit = Number.MAX_SAFE_INTEGER, sessionId = nul
       ) {
         parsed = await readPrefix(sourceFile, cursor.byte_offset, createAccumulator(session));
         if (parsed.identity !== session.id) throw new Error("transcript-identity-mismatch");
-      } else if (before.length === 1) {
-        const a = createAccumulator(session, before[0]);
-        const page = db.prepare(
-          "SELECT id,data FROM events WHERE session_id=? AND event_type='codex_token_count' AND id>? ORDER BY id LIMIT 1000"
-        );
-        let offset = 0;
-        for (;;) {
-          const data = page.all(session.id, offset);
-          if (!data.length) break;
-          for (const row of data) a.accept({ type: "event_msg", payload: JSON.parse(row.data) });
-          offset = data[data.length - 1].id;
-          await new Promise((resolve) => setImmediate(resolve));
-        }
-        parsed = a.result();
       } else throw new Error("missing-complete-transcript");
       if (!parsed.seen) throw new Error("missing-token-records");
       if (stat && !same(stat, fingerprint(sourceFile))) throw new Error("transcript-changed");
@@ -238,7 +221,6 @@ async function planRepair(db, { limit = Number.MAX_SAFE_INTEGER, sessionId = nul
         sourceFile,
         canonicalStat,
         stat,
-        maxEvent: maxEvent.get(session.id).id,
       });
     } catch (error) {
       skipped.push({
@@ -252,7 +234,7 @@ async function planRepair(db, { limit = Number.MAX_SAFE_INTEGER, sessionId = nul
   return { entries, skipped, unchanged, scanned: sessions.length };
 }
 
-function writeExclusive(file, content) {
+function writeExclusive(file, content, { syncDirectory = true } = {}) {
   const fd = fs.openSync(file, "wx", 0o600);
   try {
     fs.writeFileSync(fd, content);
@@ -261,7 +243,9 @@ function writeExclusive(file, content) {
     fs.closeSync(fd);
   }
   // Flush the new directory entry before committing any application-data change.
-  // If the filesystem cannot provide this guarantee, refuse repair writes.
+  // If the filesystem cannot provide this guarantee, refuse repair writes. A
+  // preview plan changes no data, so it does not need (or fail on) this flush.
+  if (!syncDirectory) return;
   const directory = fs.openSync(path.dirname(path.resolve(file)), "r");
   try {
     fs.fsyncSync(directory);
@@ -286,16 +270,10 @@ function applyRepair(db, plan, journalPath) {
     const cursor = db
       .prepare("SELECT * FROM codex_ingest_state WHERE transcript_path=?")
       .get(entry.session.transcript_path || "");
-    const event = db
-      .prepare(
-        "SELECT MAX(id) AS id FROM events WHERE session_id=? AND event_type='codex_token_count'"
-      )
-      .get(entry.session.id).id;
     if (
       !same(current ? { ...current } : null, entry.session) ||
       !same(cursor ? { ...cursor } : null, entry.cursor) ||
       !same(plain(rows.all(entry.session.id)), entry.before) ||
-      event !== entry.maxEvent ||
       !same(fingerprint(entry.sourceFile || ""), entry.stat) ||
       !same(fingerprint(entry.session.transcript_path || ""), entry.canonicalStat)
     )
@@ -356,7 +334,9 @@ async function main(args) {
     db.pragma("busy_timeout = 1000");
     const plan = await planRepair(db, { sessionId: option("--session") || null });
     if (args.includes("--out"))
-      writeExclusive(option("--out"), JSON.stringify(plan, null, 2) + "\n");
+      writeExclusive(option("--out"), JSON.stringify(plan, null, 2) + "\n", {
+        syncDirectory: false,
+      });
     const result = apply ? applyRepair(db, plan, option("--journal")) : {};
     console.log(
       JSON.stringify({
