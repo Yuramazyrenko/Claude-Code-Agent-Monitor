@@ -21,7 +21,7 @@ process.env.DASHBOARD_CODEX_HOME = path.join(TMP_ROOT, "codex");
 process.env.DASHBOARD_REMOTE_SYNC_MS = "0";
 process.env.DASHBOARD_LIVENESS_PROBE = "0";
 
-const { createApp, startServer } = require("../index");
+const { createApp, startServer, isCodexForeignSessionError } = require("../index");
 const dbModule = require("../db");
 const { db, stmts } = dbModule;
 const remoteSync = require("../lib/remote-sync");
@@ -639,12 +639,17 @@ describe("native Codex rollout ownership after remote ingestion", () => {
       });
       const before = capture();
       const live = codexRollout(process.env.DASHBOARD_CODEX_HOME, sid, 2);
+      let thrown = null;
       try {
         // The live sweep calls the ingestor without an import exclusion callback.
         ingestCodexTranscript(live, { liveTranscripts: new Set([path.resolve(live)]) });
       } catch (err) {
-        assert.match(err.message, /another source or provider/);
+        thrown = err;
       }
+      assert.match(thrown?.message || "", /another source or provider/);
+      // The sweep must classify this as a permanent skip, not a retryable failure.
+      assert.equal(isCodexForeignSessionError(thrown), true);
+      assert.equal(isCodexForeignSessionError(new Error("SQLITE_BUSY")), false);
       assert.deepEqual(capture(), before);
       assert.equal(stmts.getCodexIngestState.get(live), undefined);
     });
