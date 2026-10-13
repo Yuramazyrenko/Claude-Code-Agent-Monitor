@@ -559,4 +559,28 @@ describe("cost snapshot", () => {
     );
     assert.equal(fs.existsSync(missing), false);
   });
+
+  it(
+    "opens in-memory and temporary builtin databases despite fileMustExist",
+    { skip: builtinSkip },
+    () => {
+      const Compat = require("../compat-sqlite");
+      const cwd = process.cwd();
+      process.chdir(TMP_ROOT);
+      try {
+        for (const name of [":memory:", "", " :memory: "]) {
+          const handle = new Compat(name, { fileMustExist: true });
+          try {
+            assert.equal(handle.prepare("SELECT 1 AS one").get().one, 1, JSON.stringify(name));
+          } finally {
+            handle.close();
+          }
+        }
+        // Like better-sqlite3, the padded name is trimmed rather than creating a file.
+        assert.equal(fs.existsSync(path.join(TMP_ROOT, " :memory: ")), false);
+      } finally {
+        process.chdir(cwd);
+      }
+    }
+  );
 });
