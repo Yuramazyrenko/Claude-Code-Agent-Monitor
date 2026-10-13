@@ -17,15 +17,19 @@ const { DatabaseSync } = require("node:sqlite");
 class Database {
   constructor(filePath, options = {}) {
     // Honor the better-sqlite3 open options callers rely on; without options
-    // the connection opens exactly as before.
-    if (options.fileMustExist && !fs.existsSync(filePath)) {
-      const error = new Error(`unable to open database file: ${filePath}`);
+    // the connection opens exactly as before. Like better-sqlite3, the name is
+    // trimmed, and an in-memory (":memory:") or temporary ("") database has no
+    // file to require.
+    const name = typeof filePath === "string" ? filePath.trim() : filePath;
+    const anonymous = name === "" || name === ":memory:";
+    if (options.fileMustExist && !anonymous && !fs.existsSync(name)) {
+      const error = new Error(`unable to open database file: ${name}`);
       error.code = "SQLITE_CANTOPEN";
       throw error;
     }
     this._db = options.readonly
-      ? new DatabaseSync(filePath, { readOnly: true })
-      : new DatabaseSync(filePath);
+      ? new DatabaseSync(name, { readOnly: true })
+      : new DatabaseSync(name);
     // query_only refuses writes on this connection even if a runtime ignored
     // the readOnly open flag, so read-only never degrades to read-write.
     if (options.readonly) this._db.exec("PRAGMA query_only = ON");
