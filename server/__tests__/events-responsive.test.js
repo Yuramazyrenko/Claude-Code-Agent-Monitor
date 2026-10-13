@@ -189,7 +189,14 @@ it("bounded scoped pages preserve tied ordering, offsets and old sparse history"
       // general query would fail, so success proves it avoided the history sort.
       return original.call(
         this,
-        { ...query, page: { ...query.page, sql: "SELECT * FROM missing_fallback" } },
+        {
+          ...query,
+          page: {
+            ...query.page,
+            sql: "SELECT * FROM missing_fallback",
+            sizeSql: "SELECT id, 0 AS bytes FROM missing_fallback",
+          },
+        },
         generation
       );
     }
