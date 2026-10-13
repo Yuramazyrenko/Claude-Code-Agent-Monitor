@@ -37,9 +37,20 @@ try {
   Module._load = nativeLoad;
 }
 const { db, readCountQuery, readDashboardStats } = dbModule;
-assert.equal(db instanceof require("../compat-sqlite"), useCompat);
+const Compat = require("../compat-sqlite");
+// better-sqlite3 is optional: without a loadable native driver db.js uses the compat wrapper.
+const NativeDatabase = (() => {
+  try {
+    const Native = require("better-sqlite3");
+    new Native(":memory:").close();
+    return Native;
+  } catch {
+    return null;
+  }
+})();
+assert.equal(db instanceof Compat, useCompat || !NativeDatabase);
 
-const D = require("better-sqlite3");
+const D = NativeDatabase || Compat;
 const committed = new D(process.env.DASHBOARD_DB_PATH, { readonly: true, fileMustExist: true });
 db.prepare("INSERT INTO sessions(id) VALUES('cache-session')").run();
 const sql = "SELECT COUNT(*) AS count FROM events";

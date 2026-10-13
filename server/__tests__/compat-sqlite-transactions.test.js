@@ -5,12 +5,28 @@
 const { it } = require("node:test");
 const assert = require("node:assert/strict");
 const Compat = require("../compat-sqlite");
+
+/**
+ * better-sqlite3 is optional and resolves its native addon lazily, so probe it
+ * the way server/db.js does. Only an unloadable native driver skips its cases;
+ * the builtin cases always run.
+ */
+function probeNativeDriver() {
+  try {
+    const NativeDatabase = require("better-sqlite3");
+    new NativeDatabase(":memory:").close();
+    return { Database: NativeDatabase, skip: false };
+  } catch (error) {
+    return { Database: null, skip: `better-sqlite3 native driver unavailable: ${error.message}` };
+  }
+}
+const native = probeNativeDriver();
 const drivers = [
-  ["builtin", Compat],
-  ["native", require("better-sqlite3")],
+  ["builtin", Compat, false],
+  ["native", native.Database, native.skip],
 ];
-for (const [name, Database] of drivers) {
-  it(`${name}: a failed nested session does not abort its surrounding batch`, () => {
+for (const [name, Database, skip] of drivers) {
+  it(`${name}: a failed nested session does not abort its surrounding batch`, { skip }, () => {
     const db = new Database(":memory:");
     try {
       db.exec("CREATE TABLE items(id INTEGER PRIMARY KEY)");
@@ -42,7 +58,7 @@ for (const [name, Database] of drivers) {
       db.close();
     }
   });
-  it(`${name}: outer rollback includes a released inner savepoint`, () => {
+  it(`${name}: outer rollback includes a released inner savepoint`, { skip }, () => {
     const db = new Database(":memory:");
     try {
       db.exec("CREATE TABLE items(id INTEGER PRIMARY KEY)");
@@ -60,7 +76,7 @@ for (const [name, Database] of drivers) {
       db.close();
     }
   });
-  it(`${name}: a wrapper inside an externally opened transaction leaves it open`, () => {
+  it(`${name}: a wrapper inside an externally opened transaction leaves it open`, { skip }, () => {
     const db = new Database(":memory:");
     try {
       db.exec("CREATE TABLE items(id INTEGER PRIMARY KEY); BEGIN");
