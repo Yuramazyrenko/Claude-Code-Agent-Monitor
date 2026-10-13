@@ -6,13 +6,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { StrictMode } from "react";
 import { Settings } from "../Settings";
 import { api } from "../../lib/api";
 import { eventBus } from "../../lib/eventBus";
-import { setScope } from "../../lib/dataScope";
+import { getScope, setScope } from "../../lib/dataScope";
 
 const { info } = vi.hoisted(() => ({ info: vi.fn() }));
 vi.mock("../../lib/api", () => ({
@@ -326,4 +326,134 @@ it("does not discard a successful cost result when system-info reading fails", a
   await mount();
   expect(screen.getByText("$1,234.56")).toBeInTheDocument();
   expect(screen.getByText("System info reader is busy")).toBeInTheDocument();
+});
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason: Error) => void;
+}
+
+function deferredValue<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: Error) => void;
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}
+
+function pricingRule(pattern: string) {
+  return {
+    model_pattern: pattern,
+    display_name: `${pattern} display`,
+    input_per_mtok: 1,
+    output_per_mtok: 2,
+    cache_read_per_mtok: 0.1,
+    cache_write_per_mtok: 1.25,
+    cache_write_1h_per_mtok: 2,
+    updated_at: "2026-10-01T00:00:00.000Z",
+  };
+}
+
+type PricingList = { pricing: ReturnType<typeof pricingRule>[] };
+
+/** Mount at scope `all`, switch to `local` (whose pricing read stays pending), then back. */
+async function raceScopes(stale: Deferred<PricingList>) {
+  const list = () =>
+    getScope().mode === "local"
+      ? stale.promise
+      : Promise.resolve({ pricing: [pricingRule("fresh-model")] });
+  vi.mocked(api.pricing.list).mockImplementation(list as never);
+  setScope({ mode: "all", selected: [] });
+  const view = await mount();
+  for (const mode of ["local", "all"] as const) {
+    await act(async () => {
+      setScope({ mode, selected: [] });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+  }
+  return view;
+}
+
+describe("Settings page load guard", () => {
+  const initialScope = getScope();
+  afterEach(() => {
+    vi.mocked(api.pricing.list).mockImplementation((async () => ({ pricing: [] })) as never);
+    setScope(initialScope);
+  });
+
+  it("does not let an older scope's late pricing replace the newest scope", async () => {
+    const stale = deferredValue<PricingList>();
+    const view = await raceScopes(stale);
+    const page = within(view.container);
+    expect(page.getAllByText("fresh-model").length).toBeGreaterThan(0);
+    await act(async () => {
+      stale.resolve({ pricing: [pricingRule("stale-model")] });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(page.queryByText("stale-model")).toBeNull();
+    expect(page.getAllByText("fresh-model").length).toBeGreaterThan(0);
+    view.unmount();
+  });
+
+  it("does not show an older scope's late failure", async () => {
+    const stale = deferredValue<PricingList>();
+    const view = await raceScopes(stale);
+    await act(async () => {
+      stale.reject(new Error("stale scope failed"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const page = within(view.container);
+    expect(page.queryByText("stale scope failed")).toBeNull();
+    expect(page.getAllByText("fresh-model").length).toBeGreaterThan(0);
+    view.unmount();
+  });
+});
+
+describe("Settings system-info failure", () => {
+  it("keeps pricing and home paths when system info fails and shows the failure", async () => {
+    info.mockReset().mockRejectedValue(new Error("system info unavailable"));
+    const priced = { pricing: [pricingRule("priced-model")] };
+    vi.mocked(api.pricing.list).mockResolvedValueOnce(priced as never);
+    const view = await mount();
+    const page = within(view.container);
+    const section = (id: string) => within(view.container.querySelector(`#${id}`) as HTMLElement);
+    expect(section("about").getByText("system info unavailable")).toBeInTheDocument();
+    expect(section("claude-pricing").queryByText("system info unavailable")).toBeNull();
+    expect(page.getAllByText("priced-model").length).toBeGreaterThan(0);
+    expect(page.getAllByText("/test/claude").length).toBeGreaterThan(0);
+    expect(page.getAllByText("/test/codex").length).toBeGreaterThan(0);
+    view.unmount();
+  });
+
+  it("retains the last valid system info when a later full refresh fails", async () => {
+    const view = await mount();
+    info.mockRejectedValueOnce(new Error("refresh failed"));
+    const nextHome = { claude_home: "/test/claude-next" };
+    vi.mocked(api.settings.claudeHome.get).mockResolvedValueOnce(nextHome as never);
+    await act(async () => {
+      remoteCompletion();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const page = within(view.container);
+    expect(page.getAllByText("refresh failed").length).toBeGreaterThan(0);
+    expect(page.getAllByText("/test/current.db").length).toBeGreaterThan(0);
+    expect(page.getAllByText("/test/claude-next").length).toBeGreaterThan(0);
+    view.unmount();
+  });
+
+  it("clears the system-info failure once a background read succeeds", async () => {
+    info.mockRejectedValueOnce(new Error("info briefly down"));
+    const view = await mount();
+    const page = within(view.container);
+    expect(page.getByText("info briefly down")).toBeInTheDocument();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(page.queryByText("info briefly down")).toBeNull();
+    expect(page.getAllByText("/test/current.db").length).toBeGreaterThan(0);
+    view.unmount();
+  });
 });
