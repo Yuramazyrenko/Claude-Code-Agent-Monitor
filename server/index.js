@@ -1699,5 +1699,6 @@ module.exports = {
   createIngestRetryBudget,
   createCodexProbeFence,
   isCodexForeignSessionError,
+  startCodexSessionSync,
   repairInflatedTokenTotals,
 };

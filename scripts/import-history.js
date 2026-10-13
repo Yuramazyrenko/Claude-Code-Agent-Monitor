@@ -1544,24 +1544,16 @@ function importSession(dbModule, session, importOptions = {}) {
     // subagent tokens entirely, so sessions with subagent JSONLs may be
     // under-counted. replaceTokenUsage's baseline-shift logic guarantees this
     // can never reduce a session's totals — at worst it's a no-op.
-    const hadSubagentTokens =
-      session.parsedSubagents &&
-      session.parsedSubagents.some(
-        (s) =>
-          s.tokensByModel &&
-          Object.values(s.tokensByModel).some(
-            (t) => (t.input || 0) + (t.output || 0) + (t.cacheRead || 0) + (t.cacheWrite || 0) > 0
-          )
-      );
     const tokenRowsSql = "SELECT * FROM token_usage WHERE session_id = ?";
     const tokensBefore = JSON.stringify(db.prepare(tokenRowsSql).all(session.sessionId));
     const written = writeSessionTokens(dbModule, session.sessionId, combineSessionTokens(session));
     const tokensChanged =
       written > 0 &&
       JSON.stringify(db.prepare(tokenRowsSql).all(session.sessionId)) !== tokensBefore;
-    // Report a backfill when the totals moved (or, as before, whenever subagent
-    // tokens were written) — an unchanged re-scan must not look like new work.
-    if (tokensChanged || (hadSubagentTokens && written > 0)) backfilled = true;
+    // Report a backfill only when the persisted totals moved: writeSessionTokens
+    // counts every positive bucket it upserts, so an unchanged re-scan of a
+    // session with subagent tokens must not look like new work.
+    if (tokensChanged) backfilled = true;
 
     return backfilled ? { skipped: false, backfilled: true } : { skipped: true };
   }
