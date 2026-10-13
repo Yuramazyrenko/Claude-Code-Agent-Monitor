@@ -11,11 +11,24 @@
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
 
+const fs = require("fs");
 const { DatabaseSync } = require("node:sqlite");
 
 class Database {
-  constructor(filePath) {
-    this._db = new DatabaseSync(filePath);
+  constructor(filePath, options = {}) {
+    // Honor the better-sqlite3 open options callers rely on; without options
+    // the connection opens exactly as before.
+    if (options.fileMustExist && !fs.existsSync(filePath)) {
+      const error = new Error(`unable to open database file: ${filePath}`);
+      error.code = "SQLITE_CANTOPEN";
+      throw error;
+    }
+    this._db = options.readonly
+      ? new DatabaseSync(filePath, { readOnly: true })
+      : new DatabaseSync(filePath);
+    // query_only refuses writes on this connection even if a runtime ignored
+    // the readOnly open flag, so read-only never degrades to read-write.
+    if (options.readonly) this._db.exec("PRAGMA query_only = ON");
     this._savepointSequence = 0;
   }
 

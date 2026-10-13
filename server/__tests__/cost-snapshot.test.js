@@ -24,6 +24,16 @@ const snap = require("../../scripts/cost-snapshot");
 
 let seq = 0;
 const uid = (p) => `${p}-${process.pid}-${++seq}`;
+const TOOL = path.join(__dirname, "../../scripts/cost-snapshot.js");
+// node:sqlite backs the builtin driver; only its absence skips builtin-path cases.
+const builtinSkip = (() => {
+  try {
+    require("node:sqlite");
+    return false;
+  } catch {
+    return "node:sqlite is unavailable";
+  }
+})();
 
 after(() => {
   db.close();
@@ -38,6 +48,18 @@ function seed(id, source, input) {
   db.prepare(
     "INSERT OR REPLACE INTO token_usage (session_id, model, input_tokens, output_tokens) VALUES (?, 'claude-opus-4-8', ?, 5)"
   ).run(id, input);
+}
+
+/** A rollback-journal copy of the test database that a read-only open can use. */
+function copyDatabase(target) {
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`);
+  const handle = new db.constructor(target);
+  try {
+    handle.pragma("journal_mode = DELETE");
+  } finally {
+    handle.close();
+  }
 }
 
 describe("cost snapshot", () => {
@@ -375,5 +397,106 @@ describe("cost snapshot", () => {
     assert.equal(cmp.status, 1);
     assert.match(cmp.stdout, /LOCAL sessions: changed=1/);
     assert.match(cmp.stdout, /SOURCE sessions: changed=1/);
+  });
+
+  it("defaults to the server's database, including dotenv overrides, and keeps DASHBOARD_DB_PATH first", () => {
+    const id = uid("default-path");
+    seed(id, null, 42);
+    const home = path.join(TMP_ROOT, "default-home");
+    const dataDir = path.join(TMP_ROOT, "default-data");
+    const pinned = path.join(TMP_ROOT, "default-pinned.db");
+    const missing = path.join(TMP_ROOT, "default-missing");
+    copyDatabase(path.join(home, "agent-dashboard", "dashboard.db"));
+    copyDatabase(path.join(dataDir, "dashboard.db"));
+    copyDatabase(pinned);
+    // A dotenv file holding CLAUDE_HOME, as Settings persists it for the server.
+    const dotenv = path.join(TMP_ROOT, "default-settings.env");
+    fs.writeFileSync(dotenv, `CLAUDE_HOME=${home}\n`);
+    const noDotenv = path.join(missing, ".env");
+    const cases = [
+      ["claude-home", { CLAUDE_HOME: home, DASHBOARD_ENV_PATH: noDotenv }],
+      [
+        "data-dir",
+        { CLAUDE_HOME: missing, DASHBOARD_DATA_DIR: dataDir, DASHBOARD_ENV_PATH: noDotenv },
+      ],
+      [
+        "db-path",
+        {
+          CLAUDE_HOME: missing,
+          DASHBOARD_DATA_DIR: missing,
+          DASHBOARD_DB_PATH: pinned,
+          DASHBOARD_ENV_PATH: noDotenv,
+        },
+      ],
+      ["dotenv", { DASHBOARD_ENV_PATH: dotenv }],
+    ];
+    for (const [label, overrides] of cases) {
+      // HOME points nowhere, so the old ~/.claude fallback cannot satisfy a case.
+      const env = { ...process.env, HOME: missing, USERPROFILE: missing };
+      delete env.DASHBOARD_DB_PATH;
+      delete env.DASHBOARD_DATA_DIR;
+      delete env.CLAUDE_HOME;
+      Object.assign(env, overrides);
+      const out = path.join(TMP_ROOT, `default-${label}.tsv`);
+      const result = spawnSync(process.execPath, [TOOL, "snapshot", "--out", out], {
+        encoding: "utf8",
+        env,
+      });
+      assert.equal(result.status, 0, `${label}: ${result.stdout}${result.stderr}`);
+      assert.equal(snap.readSnapshot(out).get(id).input, 42, label);
+    }
+  });
+
+  it(
+    "falls back to the builtin driver, read-only, when the native driver cannot load",
+    { skip: builtinSkip },
+    () => {
+      const id = uid("builtin");
+      seed(id, null, 77);
+      const copy = path.join(TMP_ROOT, "builtin-copy.db");
+      copyDatabase(copy);
+      const digest = () => createHash("sha256").update(fs.readFileSync(copy)).digest("hex");
+      const original = digest();
+      const out = path.join(TMP_ROOT, "builtin.tsv");
+      const code = `
+        const Module = require('node:module');
+        const originalLoad = Module._load;
+        Module._load = function (request, parent, isMain) {
+          if (request === 'better-sqlite3') throw new Error('fixture: native driver unavailable');
+          return originalLoad.call(this, request, parent, isMain);
+        };
+        require(${JSON.stringify(TOOL)}).takeSnapshot(process.argv[1], process.argv[2]);
+      `;
+      const result = spawnSync(process.execPath, ["-e", code, copy, out], { encoding: "utf8" });
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.equal(snap.readSnapshot(out).get(id).input, 77);
+      assert.equal(digest(), original, "the input database bytes stay intact");
+    }
+  );
+
+  it("opens builtin connections read-only only when asked", { skip: builtinSkip }, () => {
+    const Compat = require("../compat-sqlite");
+    const file = path.join(TMP_ROOT, "compat-readonly.db");
+    const writable = new Compat(file);
+    try {
+      writable.exec("CREATE TABLE fixture(x INTEGER); INSERT INTO fixture VALUES (1)");
+    } finally {
+      writable.close();
+    }
+    const original = fs.readFileSync(file);
+    const reader = new Compat(file, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(reader.prepare("SELECT x FROM fixture").get().x, 1);
+      assert.throws(() => reader.exec("INSERT INTO fixture VALUES (2)"));
+    } finally {
+      reader.close();
+    }
+    assert.deepEqual(fs.readFileSync(file), original);
+    const missing = path.join(TMP_ROOT, "compat-missing.db");
+    assert.throws(
+      () => new Compat(missing, { readonly: true, fileMustExist: true }),
+      (error) => error.code === "SQLITE_CANTOPEN"
+    );
+    assert.equal(fs.existsSync(missing), false);
   });
 });
