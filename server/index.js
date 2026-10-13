@@ -890,6 +890,15 @@ function createCodexProbeFence(transcripts, db, observations) {
   };
 }
 
+/**
+ * A rollout whose session another source or provider owns cannot become
+ * importable by retrying the same bytes, so the live sweep records it as done
+ * for this fingerprint instead of spending the transient-failure retry budget.
+ */
+function isCodexForeignSessionError(err) {
+  return err?.code === require("./lib/codex-ingest").CODEX_FOREIGN_SESSION;
+}
+
 function startCodexSessionSync(broadcast) {
   const fs = require("fs");
   const { getCodexHome, getCodexSessionsDir, onCodexHomeChanged } = require("./lib/codex-home");
@@ -1013,12 +1022,17 @@ function startCodexSessionSync(broadcast) {
               retryBudget.succeed(ingestKey);
             }
           } catch (err) {
-            noteIngestFailure(
-              ingestKey,
-              fingerprint,
-              `Failed to ingest ${path.basename(transcriptPath)}`,
-              err.message
-            );
+            if (isCodexForeignSessionError(err)) {
+              fingerprints.set(transcriptPath, fingerprint);
+              retryBudget.succeed(ingestKey);
+            } else {
+              noteIngestFailure(
+                ingestKey,
+                fingerprint,
+                `Failed to ingest ${path.basename(transcriptPath)}`,
+                err.message
+              );
+            }
           }
         }
         const toolKey = `tools:${transcriptPath}`;
@@ -1056,13 +1070,18 @@ function startCodexSessionSync(broadcast) {
               retryBudget.succeed(toolKey);
             }
           } catch (err) {
-            toolIngestFailed.add(transcriptPath);
-            noteIngestFailure(
-              toolKey,
-              fingerprint,
-              `Failed to index tools for ${path.basename(transcriptPath)}`,
-              err.message
-            );
+            if (isCodexForeignSessionError(err)) {
+              toolIngestFailed.delete(transcriptPath);
+              retryBudget.succeed(toolKey);
+            } else {
+              toolIngestFailed.add(transcriptPath);
+              noteIngestFailure(
+                toolKey,
+                fingerprint,
+                `Failed to index tools for ${path.basename(transcriptPath)}`,
+                err.message
+              );
+            }
           }
         }
         // Cold history can contain hundreds of large JSONL files. Yielding in
@@ -1679,5 +1698,6 @@ module.exports = {
   codexHomeChangeTriggersSweep,
   createIngestRetryBudget,
   createCodexProbeFence,
+  isCodexForeignSessionError,
   repairInflatedTokenTotals,
 };
