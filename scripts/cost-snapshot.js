@@ -26,6 +26,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { getDataDir } = require("../server/lib/claude-home");
 
 const COLUMNS = [
   "session_id",
@@ -42,11 +43,29 @@ const COLUMNS = [
   "cost_usd",
 ];
 
+/**
+ * The database the server itself opens (server/db.js): an explicit
+ * DASHBOARD_DB_PATH wins, else `dashboard.db` in the canonical data dir
+ * (DASHBOARD_DATA_DIR, else `<CLAUDE_HOME>/agent-dashboard`). The CLI loads the
+ * server's dotenv file first, so overrides saved there (e.g. by Settings) apply.
+ */
 function defaultDbPath() {
-  return (
-    process.env.DASHBOARD_DB_PATH ||
-    path.join(os.homedir(), ".claude", "agent-dashboard", "dashboard.db")
-  );
+  return process.env.DASHBOARD_DB_PATH || path.join(getDataDir(), "dashboard.db");
+}
+
+/**
+ * The SQLite driver server/db.js selects: better-sqlite3 when it loads and its
+ * lazily resolved native addon opens, else the node:sqlite compatibility
+ * wrapper (whose own load failure propagates instead of being swallowed).
+ */
+function loadDatabaseDriver() {
+  try {
+    const NativeDatabase = require("better-sqlite3");
+    new NativeDatabase(":memory:").close();
+    return NativeDatabase;
+  } catch {
+    return require("../server/compat-sqlite");
+  }
 }
 
 /** Load the cost function with the server's db module aimed at a temp database. */
@@ -78,7 +97,9 @@ function takeSnapshot(dbPath, outPath) {
   if (!fs.existsSync(dbPath)) throw new Error(`database not found: ${dbPath}`);
   // Open the target read-only BEFORE the scratch module is loaded, then restore
   // nothing: the scratch env only matters for the pricing require below.
-  const Database = require("better-sqlite3");
+  // Same driver selection as the server, so a missing native addon falls back
+  // to node:sqlite opened read-only instead of failing the snapshot.
+  const Database = loadDatabaseDriver();
   const ro = new Database(dbPath, { readonly: true, fileMustExist: true });
   let context;
   try {
@@ -302,6 +323,7 @@ function main(argv) {
 }
 
 if (require.main === module) {
+  require("../server/lib/dotenv").loadDotEnv();
   try {
     process.exitCode = main(process.argv.slice(2));
   } catch (err) {
