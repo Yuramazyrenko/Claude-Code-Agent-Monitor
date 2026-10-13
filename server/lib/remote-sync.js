@@ -938,7 +938,7 @@ function connectionSuccessMessage(source, remoteCmd, provider = "claude") {
   return `Connected. Remote ${name} history found.`;
 }
 
-// Tail window read by lastTranscriptActivityMs (a JSONL line is far below this).
+// First tail window read by lastTranscriptActivityMs; doubled while no timestamped line fits.
 const TRANSCRIPT_TAIL_BYTES = 64 * 1024;
 
 /**
@@ -955,38 +955,45 @@ function lastTranscriptActivityMs(filePath) {
   }
 
   // Only the newest timestamp matters, and this runs for every staged file on
-  // every sync tick — read just the tail (TRANSCRIPT_TAIL_BYTES), never the
-  // whole (possibly hundreds of MiB) transcript.
+  // every sync tick — normally read just the tail (TRANSCRIPT_TAIL_BYTES), not
+  // the whole (possibly hundreds of MiB) transcript. One record (a large tool
+  // result) can exceed the window; then the window doubles until a timestamped
+  // line is parsed or the read reaches byte 0. Mirror mtime stays the fallback
+  // when no timestamp can be parsed or the read fails (e.g. one record beyond
+  // V8's maximum string length).
   let contentMs = null;
   let fd = null;
   try {
     fd = fs.openSync(filePath, "r");
     const size = fs.fstatSync(fd).size;
-    const start = Math.max(0, size - TRANSCRIPT_TAIL_BYTES);
-    const buf = Buffer.alloc(size - start);
-    let got = 0;
-    while (got < buf.length) {
-      const n = fs.readSync(fd, buf, got, buf.length - got, start + got);
-      if (n <= 0) break;
-      got += n;
-    }
-    const lines = buf.toString("utf8", 0, got).split(/\n/);
-    // A tail that starts mid-file begins inside a line: drop that fragment.
-    if (start > 0) lines.shift();
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (!lines[i].trim()) continue;
-      try {
-        const row = JSON.parse(lines[i]);
-        const raw = row.timestamp || row.ts;
-        if (!raw) continue;
-        const ms = new Date(raw).getTime();
-        if (!Number.isNaN(ms)) {
-          contentMs = ms;
-          break;
-        }
-      } catch {
-        /* skip malformed tail line */
+    for (let window = TRANSCRIPT_TAIL_BYTES; contentMs == null; window *= 2) {
+      const start = Math.max(0, size - window);
+      const buf = Buffer.alloc(size - start);
+      let got = 0;
+      while (got < buf.length) {
+        const n = fs.readSync(fd, buf, got, buf.length - got, start + got);
+        if (n <= 0) break;
+        got += n;
       }
+      const lines = buf.toString("utf8", 0, got).split(/\n/);
+      // A tail that starts mid-file begins inside a line: drop that fragment.
+      if (start > 0) lines.shift();
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (!lines[i].trim()) continue;
+        try {
+          const row = JSON.parse(lines[i]);
+          const raw = row.timestamp || row.ts;
+          if (!raw) continue;
+          const ms = new Date(raw).getTime();
+          if (!Number.isNaN(ms)) {
+            contentMs = ms;
+            break;
+          }
+        } catch {
+          /* skip malformed tail line */
+        }
+      }
+      if (start === 0) break;
     }
   } catch {
     /* unreadable — fall back to mtime */
