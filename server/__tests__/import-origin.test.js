@@ -685,7 +685,7 @@ describe("native Codex rollout ownership after remote ingestion", () => {
         rec("turn_context", { model: "gpt-5.6-terra" }),
         rec("event_msg", { type: "user_message", message: "go" }),
       ].join("\\n") + "\\n");
-      const old = new Date("2026-09-01T09:00:00Z");
+      const old = new Date(fs.statSync(file).mtimeMs - 60000);
       fs.utimesSync(owned, old, old);
       const warnings = [];
       console.warn = (...args) => warnings.push(args.join(" "));
