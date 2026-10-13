@@ -208,6 +208,20 @@ function processGone(pid) {
 function exitedBeforeRead(error, pid) {
   return error?.code === "ENOENT" || error?.code === "ESRCH" || processGone(pid);
 }
+// Only this user's processes can be this dashboard's sessions, and another
+// user's cwd and descriptors are unreadable; listing them would leave every
+// census incomplete on a shared host. Without getuid (Windows) keep all rows.
+const PS_ARGS = ["-Ao", "pid=,uid=,args="];
+function ownProcessRows(psOut) {
+  const uid = typeof process.getuid === "function" ? String(process.getuid()) : null;
+  const rows = [];
+  for (const line of psOut.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+    if (m && (uid === null || m[2] === uid)) rows.push({ pid: m[1], args: m[3] });
+  }
+  return rows;
+}
+
 // lsof exits 1 when some requested pids vanished but still prints the rest.
 // A killed or truncated run is never usable; a completed non-zero exit is
 // usable only when the caller finds exited pids that explain it.
@@ -241,7 +255,7 @@ async function probeLiveCwdsAsyncImpl(binary = "claude") {
   let psOut;
   try {
     psOut = (
-      await execFileAsync("ps", ["-Ao", "pid=,args="], {
+      await execFileAsync("ps", PS_ARGS, {
         encoding: "utf8",
         timeout: 5_000,
         maxBuffer: 16 * 1024 * 1024,
@@ -251,11 +265,9 @@ async function probeLiveCwdsAsyncImpl(binary = "claude") {
     return UNAVAILABLE();
   }
 
-  const pids = [];
-  for (const line of psOut.split("\n")) {
-    const m = line.match(/^\s*(\d+)\s+(.*)$/);
-    if (m && isAgentCommand(m[2], binary)) pids.push(m[1]);
-  }
+  const pids = ownProcessRows(psOut)
+    .filter((row) => isAgentCommand(row.args, binary))
+    .map((row) => row.pid);
   const cwds = new Set();
   if (pids.length === 0) return { available: true, cwds };
 
@@ -304,7 +316,7 @@ async function probeLiveCodexRolloutsAsyncImpl() {
   let psOut;
   try {
     psOut = (
-      await execFileAsync("ps", ["-Ao", "pid=,args="], {
+      await execFileAsync("ps", PS_ARGS, {
         encoding: "utf8",
         timeout: 5_000,
         maxBuffer: 16 * 1024 * 1024,
@@ -313,11 +325,9 @@ async function probeLiveCodexRolloutsAsyncImpl() {
   } catch {
     return { available: false, paths: new Set() };
   }
-  const pids = [];
-  for (const line of psOut.split("\n")) {
-    const match = line.match(/^\s*(\d+)\s+(.*)$/);
-    if (match && isCodexCommand(match[2])) pids.push(match[1]);
-  }
+  const pids = ownProcessRows(psOut)
+    .filter((row) => isCodexCommand(row.args))
+    .map((row) => row.pid);
   const paths = new Set();
   if (pids.length === 0) return { available: true, paths };
 
