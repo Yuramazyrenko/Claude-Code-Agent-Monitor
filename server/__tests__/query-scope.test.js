@@ -161,7 +161,7 @@ it("title refresh returns complete changed rows and leaves unchanged metadata in
   assert.deepEqual(stmts.getSession.get(id), before);
 });
 
-it("Claude-format watchdog parsing retains Cursor/Claude and skips Codex", () => {
+it("Claude-format watchdog parsing retains Cursor/Claude and skips Codex", async () => {
   const file = path.join(root, "error.jsonl");
   fs.writeFileSync(
     file,
@@ -200,7 +200,7 @@ it("Claude-format watchdog parsing retains Cursor/Claude and skips Codex", () =>
     events: stmts.listEventsBySession.all(codex.id),
   };
   hooks.transcriptCache.invalidate(file);
-  hooks.watchdogCheck();
+  await hooks.watchdogCheck();
   for (const row of sessions.filter((row) => row.provider !== "codex"))
     assert.equal(stmts.getSession.get(row.id).status, "error");
   assert.deepEqual(

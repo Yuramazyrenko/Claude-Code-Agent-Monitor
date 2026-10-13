@@ -1,7 +1,8 @@
 /**
  * @file Exercises actual asynchronous process-probe code with controlled OS
  * commands: each caller gets a fresh census, the event loop stays free,
- * and partial/failed process censuses never become negative liveness evidence.
+ * and partial/failed process censuses never become negative liveness evidence
+ * unless the missing processes have already exited.
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
 const { it } = require("node:test");
@@ -16,6 +17,7 @@ function fixture({
   disabled = false,
   missingPid = false,
   missingCwd = false,
+  gone = [],
 } = {}) {
   const calls = [];
   const exec = () => {
@@ -48,7 +50,14 @@ function fixture({
         : name === "../../scripts/install-hooks"
           ? { isInsideContainer: () => false }
           : require(name),
-    process: { platform, env: { DASHBOARD_LIVENESS_PROBE: disabled ? "0" : "1" } },
+    process: {
+      platform,
+      env: { DASHBOARD_LIVENESS_PROBE: disabled ? "0" : "1" },
+      kill: (pid) => {
+        if (gone.includes(String(pid))) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+        return true;
+      },
+    },
   });
   return { probe: module.exports, calls };
 }
@@ -95,6 +104,22 @@ for (const failure of [
     assert.equal((await probe.probeLiveCwdsAsync()).available, false);
     assert.equal((await probe.probeLiveCodexRolloutsAsync()).available, false);
   });
+it("an lsof exit explained by processes that already exited keeps the census", async () => {
+  const failure = { code: 1, stdout: "p99\nfcwd\nn/tmp/other\n" };
+  const vanished = fixture({ failure, gone: ["42", "43"] }).probe;
+  const cwds = await vanished.probeLiveCwdsAsync();
+  assert.equal(cwds.available, true);
+  assert.deepEqual([...cwds.cwds], ["/tmp/other"]);
+  assert.equal((await vanished.probeLiveCodexRolloutsAsync()).available, true);
+  for (const unexplained of [
+    { code: 1, killed: true, signal: "SIGTERM", stdout: failure.stdout },
+    { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", stdout: failure.stdout },
+  ]) {
+    const { probe } = fixture({ failure: unexplained, gone: ["42", "43"] });
+    assert.equal((await probe.probeLiveCwdsAsync()).available, false);
+    assert.equal((await probe.probeLiveCodexRolloutsAsync()).available, false);
+  }
+});
 it("unsupported hosts and the escape hatch never run OS commands", async () => {
   for (const options of [{ platform: "win32" }, { disabled: true }]) {
     const { probe, calls } = fixture(options);
