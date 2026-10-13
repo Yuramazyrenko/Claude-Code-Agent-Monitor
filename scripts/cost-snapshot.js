@@ -78,25 +78,46 @@ function loadPricing() {
   }
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cost-snapshot-"));
   const scratchPath = path.join(tmp, "scratch.db");
+  const priorEnv = {
+    DASHBOARD_DB_PATH: process.env.DASHBOARD_DB_PATH,
+    DASHBOARD_DATA_DIR: process.env.DASHBOARD_DATA_DIR,
+  };
+  const priorModules = new Set(Object.keys(require.cache));
+  // Undo the redirect for the caller: its environment comes back, and every
+  // module loaded against the scratch database leaves the require cache, so a
+  // later require("../server/db") opens the caller's database, not a closed one.
+  const restore = () => {
+    for (const [key, value] of Object.entries(priorEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    for (const id of Object.keys(require.cache)) {
+      if (!priorModules.has(id)) delete require.cache[id];
+    }
+  };
   process.env.DASHBOARD_DB_PATH = scratchPath;
   process.env.DASHBOARD_DATA_DIR = path.join(tmp, "data");
   try {
     const pricing = require("../server/routes/pricing");
     const loadedDb = require.cache[dbModuleId]?.exports;
     const ownedDb = loadedDb?.DB_PATH === scratchPath ? loadedDb.db : null;
-    return { pricing, tmp, ownedDb };
+    return { pricing, tmp, ownedDb, restore };
   } catch (error) {
-    const loadedDb = require.cache[dbModuleId]?.exports;
-    if (loadedDb?.DB_PATH === scratchPath) loadedDb.db.close();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    try {
+      const loadedDb = require.cache[dbModuleId]?.exports;
+      if (loadedDb?.DB_PATH === scratchPath) loadedDb.db.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    } finally {
+      restore();
+    }
     throw error;
   }
 }
 
 function takeSnapshot(dbPath, outPath) {
   if (!fs.existsSync(dbPath)) throw new Error(`database not found: ${dbPath}`);
-  // Open the target read-only BEFORE the scratch module is loaded, then restore
-  // nothing: the scratch env only matters for the pricing require below.
+  // Open the target read-only BEFORE the scratch module is loaded; the scratch
+  // environment and modules are undone in the finally block below.
   // Same driver selection as the server, so a missing native addon falls back
   // to node:sqlite opened read-only instead of failing the snapshot.
   const Database = loadDatabaseDriver();
@@ -178,11 +199,17 @@ function takeSnapshot(dbPath, outPath) {
       try {
         context?.ownedDb?.close();
       } finally {
-        if (context?.tmp) fs.rmSync(context.tmp, { recursive: true, force: true });
+        try {
+          if (context?.tmp) fs.rmSync(context.tmp, { recursive: true, force: true });
+        } finally {
+          context?.restore?.();
+        }
       }
     }
   }
 }
+
+const DECIMAL = /^-?(?:\d+|\d*\.\d+)(?:[eE][-+]?\d+)?$/;
 
 function readSnapshot(file) {
   const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
@@ -190,7 +217,19 @@ function readSnapshot(file) {
   if (head.join("\t") !== COLUMNS.join("\t"))
     throw new Error(`${file}: unsupported cost snapshot columns; regenerate both snapshots`);
   const map = new Map();
-  for (const line of lines) {
+  for (const [index, line] of lines.entries()) {
+    const fields = line.split("\t");
+    // A short row or a non-numeric value would compare as NaN, and NaN never
+    // differs, so the local-change gate could pass on an unreadable row. Accept
+    // only finite plain decimals: Number() would read " " as 0, "0x10" as 16,
+    // and "1e400" as Infinity (which never differs from another Infinity).
+    if (
+      fields.length !== COLUMNS.length ||
+      !fields.slice(3).every((v) => DECIMAL.test(v) && Number.isFinite(+v))
+    )
+      throw new Error(
+        `${file}: row ${index + 2} is incomplete or not numeric; regenerate the snapshot`
+      );
     const [
       id,
       provider,
@@ -204,7 +243,7 @@ function readSnapshot(file) {
       webFetch,
       codeExecution,
       cost,
-    ] = line.split("\t");
+    ] = fields;
     map.set(id, {
       provider,
       source,
@@ -225,7 +264,8 @@ function readSnapshot(file) {
 /**
  * Compare two snapshots. A session counts as "local" when it is local in BOTH
  * snapshots; "source" when it belongs to a remote source in both; a session
- * whose owner differs between the two is reported apart ("reassigned").
+ * whose owner (source or provider) differs between the two is reported apart
+ * ("reassigned").
  */
 function compareSnapshots(before, after) {
   const out = {
@@ -252,8 +292,14 @@ function compareSnapshots(before, after) {
       continue;
     }
     const entry = { id, source: b.source, before: a, after: b, delta: b.cost - a.cost };
-    if (a.source !== b.source) {
-      out.reassigned.push({ ...entry, from: a.source, to: b.source });
+    if (a.source !== b.source || a.provider !== b.provider) {
+      out.reassigned.push({
+        ...entry,
+        from: a.source,
+        to: b.source,
+        fromProvider: a.provider,
+        toProvider: b.provider,
+      });
       continue;
     }
     const bucket = a.source === "local" ? out.local : out.source;
@@ -286,10 +332,13 @@ function formatReport(result, limit = 20) {
       );
     }
   }
-  lines.push(
-    `REASSIGNED (owner differs between snapshots): ${result.reassigned.length}`,
-    `ADDED sessions: ${result.added.length}  REMOVED sessions: ${result.removed.length}`
-  );
+  lines.push(`REASSIGNED (owner differs between snapshots): ${result.reassigned.length}`);
+  for (const e of result.reassigned.slice(0, limit)) {
+    lines.push(
+      `  ${e.id}\t${e.fromProvider}/${e.from} -> ${e.toProvider}/${e.to}\t(${money(e.delta)})`
+    );
+  }
+  lines.push(`ADDED sessions: ${result.added.length}  REMOVED sessions: ${result.removed.length}`);
   return lines.join("\n");
 }
 

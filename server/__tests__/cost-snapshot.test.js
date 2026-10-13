@@ -101,6 +101,41 @@ describe("cost snapshot", () => {
     assert.equal(result.status, 0, result.stdout + result.stderr);
   });
 
+  it("restores the caller's environment and module cache after a cold snapshot", () => {
+    const dbModule = path.join(__dirname, "../db.js");
+    const code = `
+      const assert = require('node:assert/strict');
+      const callerEnv = [process.env.DASHBOARD_DB_PATH, process.env.DASHBOARD_DATA_DIR];
+      require(${JSON.stringify(TOOL)}).takeSnapshot(process.argv[1], process.argv[2]);
+      assert.deepEqual([process.env.DASHBOARD_DB_PATH, process.env.DASHBOARD_DATA_DIR], callerEnv);
+      // A caller without the variables must not inherit the scratch values.
+      delete process.env.DASHBOARD_DB_PATH;
+      delete process.env.DASHBOARD_DATA_DIR;
+      require(${JSON.stringify(TOOL)}).takeSnapshot(process.argv[1], process.argv[3]);
+      assert.equal('DASHBOARD_DB_PATH' in process.env, false);
+      assert.equal('DASHBOARD_DATA_DIR' in process.env, false);
+      process.env.DASHBOARD_DB_PATH = callerEnv[0];
+      process.env.DASHBOARD_DATA_DIR = callerEnv[1];
+      assert.equal(require.cache[${JSON.stringify(dbModule)}], undefined, 'scratch db module left the cache');
+      const { db, DB_PATH } = require(${JSON.stringify(dbModule)});
+      assert.equal(DB_PATH, callerEnv[0]);
+      assert.equal(db.open, true);
+      db.close();
+    `;
+    const result = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        code,
+        process.env.DASHBOARD_DB_PATH,
+        path.join(TMP_ROOT, "cold-restore.tsv"),
+        path.join(TMP_ROOT, "cold-restore-unset.tsv"),
+      ],
+      { encoding: "utf8" }
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+  });
+
   it("closes both connections when pricing initialization fails", () => {
     const tool = path.join(__dirname, "../../scripts/cost-snapshot.js");
     const dbModule = path.join(__dirname, "../db.js");
@@ -112,6 +147,8 @@ describe("cost snapshot", () => {
       const NativeDatabase = require('better-sqlite3');
       const originalLoad = Module._load;
       const handles = [];
+      const callerEnv = [process.env.DASHBOARD_DB_PATH, process.env.DASHBOARD_DATA_DIR];
+      let scratchDir;
       Module._load = function (request, parent, isMain) {
         if (request === 'better-sqlite3') {
           return class extends NativeDatabase {
@@ -119,6 +156,7 @@ describe("cost snapshot", () => {
           };
         }
         if (Module._resolveFilename(request, parent) === ${JSON.stringify(pricingModule)}) {
+          scratchDir = require('node:path').dirname(process.env.DASHBOARD_DB_PATH);
           originalLoad(${JSON.stringify(dbModule)}, parent, false);
           throw new Error('fixture pricing initialization failed');
         }
@@ -130,7 +168,10 @@ describe("cost snapshot", () => {
       );
       assert.ok(handles.length >= 2, 'target and scratch were opened');
       assert.ok(handles.every(db => !db.open), 'all owned handles must close after load failure');
-      assert.equal(fs.existsSync(require('node:path').dirname(process.env.DASHBOARD_DB_PATH)), false);
+      assert.ok(scratchDir, 'pricing was loaded against the scratch database');
+      assert.equal(fs.existsSync(scratchDir), false);
+      assert.deepEqual([process.env.DASHBOARD_DB_PATH, process.env.DASHBOARD_DATA_DIR], callerEnv);
+      assert.equal(require.cache[${JSON.stringify(dbModule)}], undefined, 'scratch db module left the cache');
     `;
     const result = spawnSync(
       process.execPath,
@@ -145,15 +186,17 @@ describe("cost snapshot", () => {
     const after = path.join(TMP_ROOT, "gate-after.tsv");
     const header =
       "session_id\tprovider\tsource\tinput\toutput\tcache_read\tcache_write\tcache_write_1h\tweb_search\tweb_fetch\tcode_execution\tcost_usd\n";
-    const row = (source) => `gate-id\tclaude\t${source}\t10\t20\t300\t4\t0\t0\t0\t0\t0.01\n`;
-    for (const [from, to, expected] of [
+    const row = (source, provider = "claude") =>
+      `gate-id\t${provider}\t${source}\t10\t20\t300\t4\t0\t0\t0\t0\t0.01\n`;
+    for (const [from, to, expected, toProvider] of [
       ["local", "src-box", 1],
       ["src-box", "local", 1],
       ["local", null, 1],
       ["src-one", "src-two", 0],
+      ["local", "local", 1, "codex"],
     ]) {
       fs.writeFileSync(before, header + row(from));
-      fs.writeFileSync(after, header + (to === null ? "" : row(to)));
+      fs.writeFileSync(after, header + (to === null ? "" : row(to, toProvider)));
       const result = spawnSync(
         process.execPath,
         [
@@ -166,6 +209,7 @@ describe("cost snapshot", () => {
         { encoding: "utf8" }
       );
       assert.equal(result.status, expected, result.stderr + result.stdout);
+      if (toProvider) assert.match(result.stdout, /gate-id\tclaude\/local -> codex\/local/);
     }
   });
 
@@ -261,6 +305,22 @@ describe("cost snapshot", () => {
       (error) => error.code === "EEXIST"
     );
     assert.equal(fs.readFileSync(previous, "utf8"), "previous baseline\n");
+  });
+
+  it("refuses a row with a missing or non-numeric field instead of comparing NaN", () => {
+    const header =
+      "session_id\tprovider\tsource\tinput\toutput\tcache_read\tcache_write\tcache_write_1h\tweb_search\tweb_fetch\tcode_execution\tcost_usd\n";
+    for (const [name, row] of [
+      ["short-row", "id-1\tclaude\tlocal\t10\t20\t300\t4\t0\t0\t0\t0\n"],
+      ["nan-cost", "id-1\tclaude\tlocal\t10\t20\t300\t4\t0\t0\t0\t0\tn/a\n"],
+      ["blank-cost", "id-1\tclaude\tlocal\t10\t20\t300\t4\t0\t0\t0\t0\t \n"],
+      ["hex-input", "id-1\tclaude\tlocal\t0x10\t20\t300\t4\t0\t0\t0\t0\t0.01\n"],
+      ["overflow-cost", "id-1\tclaude\tlocal\t10\t20\t300\t4\t0\t0\t0\t0\t1e400\n"],
+    ]) {
+      const file = path.join(TMP_ROOT, `${name}.tsv`);
+      fs.writeFileSync(file, header + row);
+      assert.throws(() => snap.readSnapshot(file), /row 2 is incomplete or not numeric/, name);
+    }
   });
 
   it("refuses older partial snapshot columns instead of assuming missing usage is zero", () => {
