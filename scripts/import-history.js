@@ -1841,12 +1841,26 @@ async function importAllSessions(dbModule) {
   let skipped = 0;
   let errors = 0;
 
+  // Ownership is decided inside the write transaction: parsing yields to
+  // remote-sync, so a row may change owner between parse and import. Foreign
+  // rows are skipped entirely; locally owned rows stay accepted even when
+  // importSession leaves them unchanged, so their transcript snapshot and
+  // workflow links are published exactly as before.
+  const isForeignSession = (sessionId) =>
+    !isLocalHistoryOwner(dbModule.stmts.getSession.get(sessionId), "claude");
   const importBatch = dbModule.db.transaction((sessions) => {
+    const accepted = [];
     for (const session of sessions) {
+      if (isForeignSession(session.sessionId)) {
+        skipped++;
+        continue;
+      }
       const result = importSession(dbModule, session);
+      accepted.push(session);
       if (result.skipped) skipped++;
       else imported++;
     }
+    return accepted;
   });
 
   for (const projDir of projectDirs) {
@@ -1870,10 +1884,12 @@ async function importAllSessions(dbModule) {
     }
 
     if (batch.length > 0) {
-      importBatch(batch);
+      const accepted = importBatch(batch);
       // Snapshot transcripts into the dashboard's data dir so they outlive
-      // Claude Code's cleanupPeriodDays pruning (default 30 days).
-      for (const session of batch) {
+      // Claude Code's cleanupPeriodDays pruning (default 30 days). Publish only
+      // rows this local history still owns.
+      for (const session of accepted) {
+        if (isForeignSession(session.sessionId)) continue;
         snapshotTranscript(session._sourceJsonlPath, session.sessionId);
       }
       // Link Workflow-tool inner agents to their run. Workflow runs write a
@@ -1882,8 +1898,9 @@ async function importAllSessions(dbModule) {
       // every inner agent orphaned (workflow_run_id = NULL). Run it here, OUTSIDE
       // the sqlite transaction (the ingest is async), mirroring the server's
       // startup ingestAllWorkflows so a CLI rescan links them too. Idempotent and
-      // cheap for sessions with no workflow artifacts (early return).
-      await ingestWorkflowsForBatch(dbModule, batch);
+      // cheap for sessions with no workflow artifacts (early return). The
+      // exclusion predicate is re-evaluated after each await inside the ingest.
+      await ingestWorkflowsForBatch(dbModule, accepted, { isExcludedSession: isForeignSession });
     }
   }
 
@@ -2012,6 +2029,11 @@ async function syncDefaultProjects(dbModule, options = {}) {
         // re-parse an unusable file every tick.
         mtimeCache.set(sourcePath, mtime);
         if (!session) continue;
+        // The parse above yielded the event loop, so remote-sync may have
+        // claimed this id meanwhile. Re-check ownership before any write or
+        // publication (snapshot, change report), not just token usage.
+        const currentRow = dbModule.stmts.getSession.get(session.sessionId);
+        if (!isLocalHistoryOwner(currentRow, "claude")) continue;
 
         const result = importSession(dbModule, session);
         snapshotTranscript(session._sourceJsonlPath, session.sessionId);

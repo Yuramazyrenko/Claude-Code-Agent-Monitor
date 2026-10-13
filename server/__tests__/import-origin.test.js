@@ -25,8 +25,10 @@ const { createApp, startServer } = require("../index");
 const dbModule = require("../db");
 const { db, stmts } = dbModule;
 const remoteSync = require("../lib/remote-sync");
-const { importFromDirectory, syncDefaultProjects } = require("../../scripts/import-history");
+const importHistory = require("../../scripts/import-history");
+const { importFromDirectory, syncDefaultProjects, importAllSessions } = importHistory;
 const { getTranscriptSnapshotDir } = require("../lib/claude-home");
+const { ingestAllWorkflows } = require("../lib/workflow-ingest");
 const { getCodexImportSnapshotDir, importCodexFromDirectory } = require("../lib/codex-import");
 const {
   ingestCodexTranscript,
@@ -738,3 +740,143 @@ for (const deleted of [false, true]) {
     assert.deepEqual({ row: { ...stmts.getSession.get(sid) }, state: state(sid) }, before);
   });
 }
+
+// ── Default Claude history: rescan and periodic sweep ───────────────────────
+const projectsDir = () => path.join(process.env.CLAUDE_HOME, "projects");
+function writeLiveWorkflow(root, sid, runId, agentId) {
+  const runDir = path.join(root, "-tmp-proj", sid, "subagents", "workflows", runId);
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(path.join(runDir, `agent-${agentId}.jsonl`), subLines(2));
+  fs.writeFileSync(
+    path.join(runDir, "journal.jsonl"),
+    [
+      JSON.stringify({ type: "started", agentId }),
+      JSON.stringify({ type: "result", agentId, result: "ok" }),
+    ].join("\n") + "\n"
+  );
+}
+
+for (const deleted of [false, true]) {
+  it(`the default rescan leaves remote-owned history untouched${deleted ? " after source deletion" : ""}`, async () => {
+    const sid = uid("rescan-collision");
+    const stage = mkStage();
+    writeSession(stage, sid, 2);
+    const source = newSource();
+    await remoteSync.ingestStagedProvider(dbModule, source, "claude", stage);
+    if (deleted) assert.equal((await del(`/api/remote-sources/${source.id}`)).status, 200);
+    writeSession(projectsDir(), sid, 4, [1]);
+    writeLiveWorkflow(projectsDir(), sid, uid("wf-foreign"), "scout");
+    const capture = () => ({
+      row: { ...stmts.getSession.get(sid) },
+      state: state(sid, claudeSnap(sid)),
+      workflows: stmts.listWorkflowsBySession.all(sid),
+    });
+    const before = capture();
+    await importAllSessions(dbModule);
+    assert.deepEqual(
+      capture(),
+      before,
+      "a foreign row gets no events, tokens, agents, snapshot or workflow links"
+    );
+  });
+}
+
+for (const remote of [true, false]) {
+  it(`the first-boot workflow backfill ${remote ? "leaves a remote-owned row alone" : "still links a local row"}`, async () => {
+    const sid = uid(remote ? "backfill-foreign" : "backfill-local");
+    const runId = uid("wf-backfill");
+    if (remote) {
+      const stage = mkStage();
+      writeSession(stage, sid, 2);
+      await remoteSync.ingestStagedProvider(dbModule, newSource(), "claude", stage);
+      // A legacy row without a stored transcript path resolves through its cwd to a same-id local file.
+      db.prepare("UPDATE sessions SET transcript_path = NULL WHERE id = ?").run(sid);
+    } else {
+      stmts.insertSession.run(sid, "live local", "active", "/tmp/proj", MODEL, null);
+      stmts.insertAgent.run(
+        `${sid}-main`,
+        sid,
+        "Main Agent",
+        "main",
+        null,
+        "working",
+        null,
+        null,
+        null
+      );
+    }
+    writeSession(projectsDir(), sid, 4, [1]);
+    writeLiveWorkflow(projectsDir(), sid, runId, "scout");
+    const before = stmts.listWorkflowsBySession.all(sid);
+    await ingestAllWorkflows(dbModule);
+    const linked = stmts.getAgent.get(`${sid}-jsonl-scout`)?.workflow_run_id ?? null;
+    if (remote) {
+      assert.deepEqual(stmts.listWorkflowsBySession.all(sid), before, "no workflow rows");
+      assert.equal(linked, null, "no local workflow agents under the remote row");
+    } else {
+      assert.equal(linked, runId, "the local row's workflow agents are linked");
+    }
+  });
+}
+
+it("the default rescan still publishes a locally owned row it leaves unchanged", async () => {
+  const sid = uid("rescan-local");
+  const runId = uid("wf-local");
+  stmts.insertSession.run(sid, "live local", "active", "/tmp/proj", MODEL, null);
+  // Workflow agents are inserted under the session's main agent, so the live row needs one.
+  stmts.insertAgent.run(
+    `${sid}-main`,
+    sid,
+    "Main Agent",
+    "main",
+    null,
+    "working",
+    null,
+    null,
+    null
+  );
+  writeSession(projectsDir(), sid, 2);
+  writeLiveWorkflow(projectsDir(), sid, runId, "scout");
+  const metadata = stmts.getSession.get(sid).metadata;
+  await importAllSessions(dbModule);
+  assert.equal(stmts.getSession.get(sid).metadata, metadata, "hook-owned row stays unimported");
+  assert.ok(fs.existsSync(claudeSnap(sid)), "its transcript is still snapshotted");
+  const linked = db
+    .prepare("SELECT workflow_run_id FROM agents WHERE id = ?")
+    .get(`${sid}-jsonl-scout`);
+  assert.equal(linked?.workflow_run_id, runId, "its workflow agents are still linked");
+});
+
+it("the periodic sweep re-checks ownership after its awaited parse", async () => {
+  const sid = uid("sweep-race");
+  writeSession(projectsDir(), sid, 2);
+  const file = path.resolve(projectsDir(), "-tmp-proj", `${sid}.jsonl`);
+  const source = newSource();
+  const realStream = fs.createReadStream;
+  let claimed = false;
+  fs.createReadStream = function (target, ...rest) {
+    if (!claimed && path.resolve(String(target)) === file) {
+      // Remote-sync creates and owns the row while the transcript is parsed.
+      claimed = true;
+      const origin = JSON.stringify({ origin_host: "fixture-remote" });
+      stmts.insertSession.run(sid, "remote", "completed", "/tmp/proj", MODEL, origin);
+      stmts.setSessionSource.run(source.id, sid);
+    }
+    return realStream.call(this, target, ...rest);
+  };
+  let result;
+  try {
+    result = await syncDefaultProjects(dbModule, { mtimeCache: new Map() });
+  } finally {
+    fs.createReadStream = realStream;
+  }
+  assert.equal(claimed, true, "the claim fired during the parse");
+  assert.equal(
+    result.changed.some((entry) => entry.sessionId === sid),
+    false
+  );
+  assert.equal(fs.existsSync(claudeSnap(sid)), false, "no local snapshot of remote history");
+  assert.equal(state(sid).events, 0);
+  assert.deepEqual(tokenRows(sid), []);
+  assert.equal(stmts.getSession.get(sid).source, source.id);
+});
