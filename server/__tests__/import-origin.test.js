@@ -676,20 +676,36 @@ describe("native Codex rollout ownership after remote ingestion", () => {
         rec("turn_context", { model: "gpt-5.6-terra" }),
         rec("event_msg", { type: "user_message", message: "go" }),
       ].join("\\n") + "\\n");
+      // A locally owned rollout with an older mtime: the sweep takes the newest
+      // file first, so once this one is ingested the foreign one was handled.
+      const ownedId = process.argv[2];
+      const owned = path.join(path.dirname(file), "rollout-2026-09-01T09-00-00-" + ownedId + ".jsonl");
+      fs.writeFileSync(owned, [
+        rec("session_meta", { id: ownedId, cwd: "/local/codex" }),
+        rec("turn_context", { model: "gpt-5.6-terra" }),
+        rec("event_msg", { type: "user_message", message: "go" }),
+      ].join("\\n") + "\\n");
+      const old = new Date("2026-09-01T09:00:00Z");
+      fs.utimesSync(owned, old, old);
       const warnings = [];
       console.warn = (...args) => warnings.push(args.join(" "));
       require(${JSON.stringify(path.join(__dirname, "../index.js"))}).startCodexSessionSync(() => {});
-      setTimeout(() => {
+      const deadline = Date.now() + 20000;
+      const report = () => {
+        const sweptOwned = !!stmts.getSession.get(ownedId);
+        if (!sweptOwned && Date.now() < deadline) return setTimeout(report, 50);
         const row = stmts.getSession.get(process.argv[1]);
         process.stdout.write(JSON.stringify({
+          sweptOwned,
           failures: warnings.filter((w) => w.includes("[CODEX SYNC]")),
           source: row.source,
           cursor: stmts.getCodexIngestState.get(file) || null,
         }));
         process.exit(0);
-      }, 1500);
+      };
+      report();
     `;
-    const result = spawnSync(process.execPath, ["-e", code, sid], {
+    const result = spawnSync(process.execPath, ["-e", code, sid, codexUuid()], {
       encoding: "utf8",
       env: {
         ...process.env,
@@ -704,6 +720,7 @@ describe("native Codex rollout ownership after remote ingestion", () => {
     });
     assert.equal(result.status, 0, result.stderr);
     const out = JSON.parse(result.stdout);
+    assert.equal(out.sweptOwned, true, "the sweep ran past the foreign rollout");
     assert.deepEqual(out.failures, [], "a foreign owner is a skip, not a retryable ingest failure");
     assert.equal(out.source, "src-foreign");
     assert.equal(out.cursor, null);
