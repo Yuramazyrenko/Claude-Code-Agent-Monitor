@@ -1510,9 +1510,13 @@ export function Settings() {
   const [error, setError] = useState<string | null>(null);
   const [totalCost, setTotalCost] = useState<number | null>(null);
   const [sysInfo, setSysInfo] = useState<SystemInfo | null>(null);
+  /** The last system-info read failure ("" = no message); cleared by the next successful read. */
+  const [infoError, setInfoError] = useState<string | null>(null);
   const infoRequestRef = useRef<Promise<SystemInfo> | null>(null);
   const infoGenerationRef = useRef(0);
   const infoMountedRef = useRef(false);
+  /** Monotonic page-load generation: only the newest load may apply data, errors, or loading. */
+  const costLoadGeneration = useRef(0);
   useEffect(() => {
     infoMountedRef.current = true;
     return () => {
@@ -1532,10 +1536,21 @@ export function Settings() {
     if (infoRequestRef.current) return infoRequestRef.current;
     const request = api.settings
       .info()
-      .then((result) => {
-        if (infoMountedRef.current && generation === infoGenerationRef.current) setSysInfo(result);
-        return result;
-      })
+      .then(
+        (result) => {
+          if (infoMountedRef.current && generation === infoGenerationRef.current) {
+            setSysInfo(result);
+            setInfoError(null);
+          }
+          return result;
+        },
+        (err: unknown) => {
+          // System info owns its failure: shown in its own section, never over the pricing table.
+          if (infoMountedRef.current && generation === infoGenerationRef.current)
+            setInfoError(err instanceof Error ? err.message : "");
+          throw err;
+        }
+      )
       .finally(() => {
         if (infoRequestRef.current === request) infoRequestRef.current = null;
       });
@@ -1675,32 +1690,45 @@ export function Settings() {
 
   /**
    * Load everything the page needs in parallel: Claude pricing, total cost, system info, and the
-   * Claude and Codex home directories.
+   * Claude and Codex home directories. System info settles on its own and reports its failure in
+   * its own section (see refreshInfo), so it never discards the other results or blocks them.
    */
   const load = useCallback(
     async (freshInfo = false) => {
-      const generation = infoGenerationRef.current;
+      // Every load (mount, scope change, refresh, remote sync) takes a newer generation; only the
+      // newest may apply data, an error, or the end of loading.
+      const generation = ++costLoadGeneration.current;
+      const isCurrent = () => infoMountedRef.current && generation === costLoadGeneration.current;
       try {
-        const [pricingRes, costRes, , claudeHomeRes, codexHomeRes] = await Promise.all([
-          api.pricing.list(),
-          api.pricing.totalCost(),
+        const [pageRes] = await Promise.allSettled([
+          Promise.all([
+            api.pricing.list(),
+            api.pricing.totalCost(),
+            api.settings.claudeHome.get(),
+            api.settings.codexHome.get(),
+          ]),
           refreshInfo(freshInfo),
-          api.settings.claudeHome.get(),
-          api.settings.codexHome.get(),
         ]);
-        if (!infoMountedRef.current || generation !== infoGenerationRef.current) return;
-        setPricing(pricingRes.pricing);
-        setTotalCost(costRes.total_cost);
-        setClaudeHomeState(claudeHomeRes.claude_home);
-        setClaudeHomeInput(claudeHomeRes.claude_home);
-        setCodexHomeState(codexHomeRes.codex_home);
-        setCodexHomeInput(codexHomeRes.codex_home);
-        setError(null);
+        if (!isCurrent()) return;
+        if (pageRes.status === "fulfilled") {
+          const [pricingRes, costRes, claudeHomeRes, codexHomeRes] = pageRes.value;
+          setPricing(pricingRes.pricing);
+          setTotalCost(costRes.total_cost);
+          setClaudeHomeState(claudeHomeRes.claude_home);
+          setClaudeHomeInput(claudeHomeRes.claude_home);
+          setCodexHomeState(codexHomeRes.codex_home);
+          setCodexHomeInput(codexHomeRes.codex_home);
+        }
+        if (pageRes.status === "rejected") {
+          const reason: unknown = pageRes.reason;
+          setError(reason instanceof Error ? reason.message : t("messages.failedLoad"));
+        } else {
+          setError(null);
+        }
       } catch (err) {
-        if (infoMountedRef.current && generation === infoGenerationRef.current)
-          setError(err instanceof Error ? err.message : t("messages.failedLoad"));
+        if (isCurrent()) setError(err instanceof Error ? err.message : t("messages.failedLoad"));
       } finally {
-        if (infoMountedRef.current && generation === infoGenerationRef.current) setLoading(false);
+        if (isCurrent()) setLoading(false);
       }
     },
     [t, dataScope, refreshInfo]
@@ -3390,6 +3418,12 @@ export function Settings() {
           {t("about.title")}
         </h3>
         <p className="text-xs text-gray-500 mb-4">{t("about.description")}</p>
+
+        {infoError !== null && (
+          <div className="mb-4 px-4 py-2.5 bg-red-500/10 border border-red-500/20 rounded-lg text-sm text-red-400">
+            {infoError || t("messages.failedLoad")}
+          </div>
+        )}
 
         {sysInfo ? (
           <div className="card p-5">
