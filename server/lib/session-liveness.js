@@ -194,6 +194,39 @@ function probeLiveCodexRollouts() {
 // Each consumer starts its census after capturing its own lifecycle fence.
 // Watchdog/reaper and discovery callers bound their complete work separately;
 // sharing an older discovery census could close a newly active session at boot.
+// A process that exited between ps and the per-pid read holds nothing open, so
+// skipping it keeps the census complete. A pid that still exists but cannot be
+// read (another user's process, a timeout) still makes the census unavailable.
+function processGone(pid) {
+  try {
+    process.kill(Number(pid), 0);
+    return false;
+  } catch (error) {
+    return error?.code === "ESRCH";
+  }
+}
+function exitedBeforeRead(error, pid) {
+  return error?.code === "ENOENT" || error?.code === "ESRCH" || processGone(pid);
+}
+// lsof exits 1 when some requested pids vanished but still prints the rest.
+// A killed or truncated run is never usable; a completed non-zero exit is
+// usable only when the caller finds exited pids that explain it.
+async function lsofRecords(args, maxBuffer) {
+  try {
+    const { stdout } = await execFileAsync("lsof", args, {
+      encoding: "utf8",
+      timeout: 10_000,
+      maxBuffer,
+    });
+    return { stdout, failed: false };
+  } catch (error) {
+    const exited = typeof error?.code === "number" && !error.killed && !error.signal;
+    return exited && typeof error.stdout === "string"
+      ? { stdout: error.stdout, failed: true }
+      : null;
+  }
+}
+
 function probeLiveCwdsAsync(binary = "claude") {
   return probeLiveCwdsAsyncImpl(binary);
 }
@@ -231,7 +264,8 @@ async function probeLiveCwdsAsyncImpl(binary = "claude") {
     for (const pid of pids) {
       try {
         cwds.add(path.resolve(await fs.promises.readlink(`/proc/${pid}/cwd`)));
-      } catch {
+      } catch (error) {
+        if (exitedBeforeRead(error, pid)) continue;
         return UNAVAILABLE(); // An incomplete census cannot prove absence.
       }
     }
@@ -240,26 +274,12 @@ async function probeLiveCwdsAsyncImpl(binary = "claude") {
 
   // macOS (and other BSD-likes): resolve each pid's cwd via lsof. `-Fn`
   // machine format emits `p<pid>` / `f cwd` / `n<path>` records.
-  let lsofOut;
-  try {
-    lsofOut = (
-      await execFileAsync("lsof", ["-a", "-p", pids.join(","), "-d", "cwd", "-Fn"], {
-        encoding: "utf8",
-        timeout: 10_000,
-        maxBuffer: 16 * 1024 * 1024,
-      })
-    ).stdout;
-  } catch {
-    // Partial output cannot establish absence for every pid in the census.
-    return UNAVAILABLE();
-  }
-  const observedPids = new Set(
-    lsofOut
-      .split("\n")
-      .filter((line) => /^p\d+$/.test(line))
-      .map((line) => line.slice(1))
+  const census = await lsofRecords(
+    ["-a", "-p", pids.join(","), "-d", "cwd", "-Fn"],
+    16 * 1024 * 1024
   );
-  if (pids.some((pid) => !observedPids.has(pid))) return UNAVAILABLE();
+  if (!census) return UNAVAILABLE();
+  const lsofOut = census.stdout;
   const resolvedPids = new Set();
   let currentPid = null;
   for (const line of lsofOut.split("\n")) {
@@ -269,7 +289,10 @@ async function probeLiveCwdsAsyncImpl(binary = "claude") {
       resolvedPids.add(currentPid);
     }
   }
-  if (pids.some((pid) => !resolvedPids.has(pid))) return UNAVAILABLE();
+  // Partial output proves absence only for pids that no longer exist.
+  const missing = pids.filter((pid) => !resolvedPids.has(pid));
+  if (missing.some((pid) => !processGone(pid))) return UNAVAILABLE();
+  if (census.failed && missing.length === 0) return UNAVAILABLE();
   return { available: true, cwds };
 }
 
@@ -309,13 +332,16 @@ async function probeLiveCodexRolloutsAsyncImpl() {
       let descriptors;
       try {
         descriptors = await fs.promises.readdir(`/proc/${pid}/fd`);
-      } catch {
+      } catch (error) {
+        if (exitedBeforeRead(error, pid)) continue;
         return { available: false, paths: new Set() };
       }
       for (const descriptor of descriptors) {
         try {
           remember(await fs.promises.readlink(`/proc/${pid}/fd/${descriptor}`));
-        } catch {
+        } catch (error) {
+          // A descriptor closed after readdir held nothing at census time.
+          if (error?.code === "ENOENT" || processGone(pid)) continue;
           return { available: false, paths: new Set() };
         }
       }
@@ -323,25 +349,18 @@ async function probeLiveCodexRolloutsAsyncImpl() {
     return { available: true, paths };
   }
 
-  let lsofOut;
-  try {
-    lsofOut = (
-      await execFileAsync("lsof", ["-a", "-p", pids.join(","), "-Fn"], {
-        encoding: "utf8",
-        timeout: 10_000,
-        maxBuffer: 32 * 1024 * 1024,
-      })
-    ).stdout;
-  } catch {
-    return { available: false, paths: new Set() };
-  }
+  const census = await lsofRecords(["-a", "-p", pids.join(","), "-Fn"], 32 * 1024 * 1024);
+  if (!census) return { available: false, paths: new Set() };
+  const lsofOut = census.stdout;
   const observedPids = new Set(
     lsofOut
       .split("\n")
       .filter((line) => /^p\d+$/.test(line))
       .map((line) => line.slice(1))
   );
-  if (pids.some((pid) => !observedPids.has(pid))) return { available: false, paths: new Set() };
+  const missing = pids.filter((pid) => !observedPids.has(pid));
+  if (missing.some((pid) => !processGone(pid)) || (census.failed && missing.length === 0))
+    return { available: false, paths: new Set() };
   for (const line of lsofOut.split("\n")) {
     if (line.startsWith("n")) remember(line.slice(1));
   }
