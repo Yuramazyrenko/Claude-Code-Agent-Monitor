@@ -2,12 +2,20 @@
  * @file Bounded, lazy read-only SQLite worker for expensive dashboard counts and event pages.
  * Active reads share only within one database write generation; identical queued
  * reads share their future snapshot. Idle workers hold no connection or Node ref.
+ * A worker that runs out of heap during a started read rejects only that read;
+ * queued reads continue on a replacement worker.
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
 const path = require("node:path");
 const { Worker } = require("node:worker_threads");
 const { EventEmitter } = require("node:events");
 const { performance } = require("node:perf_hooks");
+
+// The worker's old generation is capped at 32 MB. Measured on Node 22.22 and 24
+// with both drivers, a .all() page of 64 KB rows survives 18.8 MB of UTF-8 and
+// runs out of heap at 20 MB (larger rows last longer); 8 MiB leaves headroom.
+const WORKER_HEAP_MB = 32;
+const EVENT_PAGE_BUDGET_BYTES = 8 * 1024 * 1024;
 
 class ReadonlyQuery extends EventEmitter {
   constructor(
@@ -16,6 +24,7 @@ class ReadonlyQuery extends EventEmitter {
       driver = "auto",
       timeoutMs = 30000,
       maxPending = 64,
+      eventPageBudgetBytes = EVENT_PAGE_BUDGET_BYTES,
       workerFactory = (file, options) => new Worker(file, options),
     } = {}
   ) {
@@ -24,6 +33,7 @@ class ReadonlyQuery extends EventEmitter {
     this.driver = driver;
     this.timeoutMs = timeoutMs;
     this.maxPending = maxPending;
+    this.eventPageBudgetBytes = eventPageBudgetBytes;
     this.workerFactory = workerFactory;
     this.worker = null;
     this.workerExit = null;
@@ -127,8 +137,12 @@ class ReadonlyQuery extends EventEmitter {
 
   start() {
     const worker = this.workerFactory(path.join(__dirname, "readonly-query-worker.js"), {
-      workerData: { dbPath: this.dbPath, driver: this.driver },
-      resourceLimits: { maxOldGenerationSizeMb: 32 },
+      workerData: {
+        dbPath: this.dbPath,
+        driver: this.driver,
+        eventPageBudgetBytes: this.eventPageBudgetBytes,
+      },
+      resourceLimits: { maxOldGenerationSizeMb: WORKER_HEAP_MB },
     });
     this.worker = worker;
     // Actual exit is the fence, including when terminate() itself rejects.
@@ -136,6 +150,7 @@ class ReadonlyQuery extends EventEmitter {
     worker.on("message", (message) => {
       if (this.worker !== worker || this.active?.id !== message.id) return;
       if (message.started) {
+        this.active.started = true;
         this.emit("started", message.id);
         return;
       }
@@ -150,7 +165,12 @@ class ReadonlyQuery extends EventEmitter {
       this.dispatch();
     });
     worker.on("error", (error) => {
-      if (this.worker === worker) this.fail(error);
+      if (this.worker !== worker) return;
+      // A heap limit hit while serving a started read belongs to that read.
+      // Startup and other fatal errors still reject the whole queue.
+      if (error?.code === "ERR_WORKER_OUT_OF_MEMORY" && this.active?.started)
+        this.failActive(error);
+      else this.fail(error);
     });
     worker.on("exit", (code) => {
       if (this.worker === worker) this.fail(new Error(`Database reader exited (${code})`));
@@ -190,6 +210,15 @@ class ReadonlyQuery extends EventEmitter {
     // A queued expiry releases its slot without aborting unrelated work.
   }
 
+  failActive(error) {
+    const entry = this.active;
+    const failure = this.busyError(error.message);
+    failure.cause = error;
+    this.active = null;
+    this.settle(entry, failure);
+    return this.retireWorker();
+  }
+
   fail(error) {
     const failure = this.busyError(error?.message || "Database reader is unavailable");
     failure.cause = error;
@@ -209,4 +238,4 @@ function databaseGeneration(db) {
   return `${db.prepare("SELECT total_changes() AS n").get().n}:${db.pragma("data_version", { simple: true })}`;
 }
 
-module.exports = { ReadonlyQuery, databaseGeneration };
+module.exports = { ReadonlyQuery, databaseGeneration, EVENT_PAGE_BUDGET_BYTES };

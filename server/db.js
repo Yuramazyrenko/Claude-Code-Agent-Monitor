@@ -2481,20 +2481,34 @@ function readRowsQuery(sql, params = []) {
   return queryReader.read({ op: "all", sql, params }, databaseGeneration(db));
 }
 
+function readEventPageSync(page, count) {
+  return db.transaction(() => {
+    const events = db.prepare(page.sql).all(...(page.params || []));
+    const { count: total } = db.prepare(count.sql).get(...(count.params || []));
+    return { events, total };
+  })();
+}
+
 // Page payloads and their exact total must describe one SQLite snapshot, even
 // when a hook commits between the page query and count/counter resolution.
+// The worker measures payload bytes first; a page too large for its heap is
+// read here on the main thread, exactly as it was before the worker existed.
 function readEventPageQuery(page, count) {
   page = { ...page, sql: page.sql.trim() };
   count = { ...count, sql: count.sql.trim() };
-  if (!queryReader)
-    return Promise.resolve(
-      db.transaction(() => {
-        const events = db.prepare(page.sql).all(...(page.params || []));
-        const { count: total } = db.prepare(count.sql).get(...(count.params || []));
-        return { events, total };
-      })()
-    );
-  return queryReader.read({ op: "eventPage", page, count }, databaseGeneration(db));
+  if (!queryReader) return Promise.resolve(readEventPageSync(page, count));
+  const measured = {
+    ...page,
+    sizeSql: `SELECT id, IFNULL(length(CAST(summary AS BLOB)), 0) + IFNULL(length(CAST(data AS BLOB)), 0) AS bytes FROM (${page.sql})`,
+    fetchSql: "SELECT * FROM events WHERE id IN (SELECT value FROM json_each(?))",
+  };
+  return queryReader.read({ op: "eventPage", page: measured, count }, databaseGeneration(db)).then(
+    (result) => (result.overflow ? readEventPageSync(page, count) : result),
+    (error) => {
+      if (error?.cause?.code === "ERR_WORKER_OUT_OF_MEMORY") return readEventPageSync(page, count);
+      throw error;
+    }
+  );
 }
 
 function readDashboardStats(sources, providers, toLocal, toUTC) {
