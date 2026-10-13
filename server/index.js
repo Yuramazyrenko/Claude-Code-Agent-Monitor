@@ -1644,5 +1644,6 @@ module.exports = {
   codexHomeChangeTriggersSweep,
   createIngestRetryBudget,
   isCodexForeignSessionError,
+  startCodexSessionSync,
   repairInflatedTokenTotals,
 };
