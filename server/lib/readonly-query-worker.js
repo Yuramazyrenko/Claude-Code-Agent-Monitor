@@ -2,6 +2,8 @@
  * @file Executes backend-defined aggregate and event-page reads outside the HTTP thread using
  * a read-only connection. Opens no application DB module and runs no migrations.
  * Each connection closes before its result is delivered, including on errors.
+ * An event page that carries a size query is measured in SQLite before any row
+ * becomes a JS value; a page over the byte budget is reported, not materialized.
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
 const { parentPort, workerData } = require("node:worker_threads");
@@ -17,12 +19,27 @@ try {
   Database = require("../compat-sqlite");
 }
 
+// Page rows are fetched by id after measuring, so the page filter runs once.
+function readEventRows(db, page) {
+  if (!page.sizeSql) return readQuery(db, { ...page, op: "all" });
+  const sizes = readQuery(db, { sql: page.sizeSql, params: page.params, op: "all" });
+  let bytes = 0;
+  for (const row of sizes) bytes += Number(row.bytes) || 0;
+  if (bytes > workerData.eventPageBudgetBytes) return null;
+  if (!sizes.length) return [];
+  const rows = readQuery(db, {
+    sql: page.fetchSql,
+    params: [JSON.stringify(sizes.map((row) => row.id))],
+    op: "all",
+  });
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  return sizes.map((row) => byId.get(row.id));
+}
+
 function readQuery(db, query) {
   if (query.op === "eventPage") {
-    const events = readQuery(db, {
-      ...query.page,
-      op: "all",
-    });
+    const events = readEventRows(db, query.page);
+    if (!events) return { overflow: true };
     const { count: total } = readQuery(db, { ...query.count, op: "get" });
     return { events, total };
   }

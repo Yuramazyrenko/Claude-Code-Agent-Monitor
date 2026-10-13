@@ -100,7 +100,8 @@ it(
     db.exec(`DROP TABLE events;
     CREATE VIEW events AS WITH RECURSIVE counter(n) AS (
       VALUES(1) UNION ALL SELECT n+1 FROM counter WHERE n<5000000
-    ) SELECT n AS id, 'local' AS session_id, '2026-10-10' AS created_at FROM counter;`);
+    ) SELECT n AS id, 'local' AS session_id, NULL AS summary, NULL AS data,
+      '2026-10-10' AS created_at FROM counter;`);
     let resolveStarted;
     const started = new Promise((resolve) => {
       resolveStarted = resolve;
