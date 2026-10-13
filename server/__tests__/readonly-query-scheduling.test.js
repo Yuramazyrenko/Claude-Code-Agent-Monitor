@@ -178,6 +178,42 @@ it("fatal worker error rejects the queue without a restart storm", async () => {
   await close(reader, workers);
 });
 
+it("a heap limit during a started read rejects only that read", async () => {
+  const { reader, workers } = fixture();
+  const first = reader.read(query);
+  workers[0].emit("message", { id: workers[0].sent[0].id, started: true });
+  const next = reader.read(query, "different");
+  const oom = Object.assign(new Error("Worker terminated due to reaching memory limit"), {
+    code: "ERR_WORKER_OUT_OF_MEMORY",
+  });
+  workers[0].emit("error", oom);
+  await assert.rejects(first, (error) => error.status === 503 && error.cause === oom);
+  workers[0].exit();
+  await reader.terminating;
+  assert.equal(workers.length, 2, "queued work starts one replacement");
+  workers[1].finish({ count: 7 });
+  assert.deepEqual(await next, { count: 7 });
+  assert.equal(reader.pending.size, 0);
+  await close(reader, workers);
+});
+
+it("a heap limit before a read starts still rejects the queue", async () => {
+  const { reader, workers } = fixture();
+  const first = assert.rejects(reader.read(query), /memory limit/);
+  const next = assert.rejects(reader.read(query, "different"), /memory limit/);
+  workers[0].emit(
+    "error",
+    Object.assign(new Error("Worker terminated due to reaching memory limit"), {
+      code: "ERR_WORKER_OUT_OF_MEMORY",
+    })
+  );
+  await Promise.all([first, next]);
+  workers[0].exit();
+  await reader.terminating;
+  assert.equal(workers.length, 1);
+  await close(reader, workers);
+});
+
 it("a rejected terminate call cannot release the actual-exit fence", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const { reader, workers } = fixture({ timeoutMs: 20 });

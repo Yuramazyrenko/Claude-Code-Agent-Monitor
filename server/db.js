@@ -2599,30 +2599,47 @@ function readRowsQuery(sql, params = [], probe = null) {
   );
 }
 
+function readEventPageSync(page, count) {
+  return db.transaction(() => {
+    let events;
+    if (page.probe) {
+      const rows = db.prepare(page.probe.sql).all(...page.probe.params);
+      if (rows.length === page.probe.limit) events = rows;
+    }
+    if (!events) events = db.prepare(page.sql).all(...(page.params || []));
+    const resolved = require("./lib/global-event-count").resolveEventCountSql(
+      db,
+      count.sql,
+      count.counterSql ?? null
+    );
+    const { count: total } = db.prepare(resolved).get(...(count.params || []));
+    return { events, total };
+  })();
+}
+
 // Page payloads and their exact total must describe one SQLite snapshot, even
 // when a hook commits between the page query and count/counter resolution.
+// The worker measures payload bytes first; a page too large for its heap is
+// read here on the main thread, exactly as it was before the worker existed.
 function readEventPageQuery(page, count) {
   page = { ...page, sql: page.sql.trim() };
   count = { ...count, sql: count.sql.trim() };
-  if (!queryReader)
-    return Promise.resolve(
-      db.transaction(() => {
-        let events;
-        if (page.probe) {
-          const rows = db.prepare(page.probe.sql).all(...page.probe.params);
-          if (rows.length === page.probe.limit) events = rows;
-        }
-        if (!events) events = db.prepare(page.sql).all(...(page.params || []));
-        const resolved = require("./lib/global-event-count").resolveEventCountSql(
-          db,
-          count.sql,
-          count.counterSql ?? null
-        );
-        const { count: total } = db.prepare(resolved).get(...(count.params || []));
-        return { events, total };
-      })()
-    );
-  return queryReader.read({ op: "eventPage", page, count }, databaseGeneration(db));
+  if (!queryReader) return Promise.resolve(readEventPageSync(page, count));
+  const sizeSql = (sql) =>
+    `SELECT id, IFNULL(length(CAST(summary AS BLOB)), 0) + IFNULL(length(CAST(data AS BLOB)), 0) AS bytes FROM (${sql})`;
+  const measured = {
+    ...page,
+    sizeSql: sizeSql(page.sql),
+    fetchSql: "SELECT * FROM events WHERE id IN (SELECT value FROM json_each(?))",
+    ...(page.probe ? { probe: { ...page.probe, sizeSql: sizeSql(page.probe.sql) } } : {}),
+  };
+  return queryReader.read({ op: "eventPage", page: measured, count }, databaseGeneration(db)).then(
+    (result) => (result.overflow ? readEventPageSync(page, count) : result),
+    (error) => {
+      if (error?.cause?.code === "ERR_WORKER_OUT_OF_MEMORY") return readEventPageSync(page, count);
+      throw error;
+    }
+  );
 }
 
 // Keep usage and all provider rate cards on one worker snapshot. Otherwise a
