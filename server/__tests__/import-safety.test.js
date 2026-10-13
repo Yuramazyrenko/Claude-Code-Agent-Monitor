@@ -7,7 +7,7 @@
  * `DELETE /api/remote-sources/:id?purge=true`. Sessions of the SAME source and
  * new ones keep importing as before. Also covers the existing-session branch of
  * importSession (tokens are always reconciled, not only when subagents carry
- * tokens) and the tail-only reader behind lastTranscriptActivityMs.
+ * tokens) and the tail-first reader behind lastTranscriptActivityMs.
  *
  * Covers both providers (Claude `importFromDirectory`, Codex
  * `importCodexFromDirectory`) through `remote-sync.ingestStagedProvider`.
@@ -309,7 +309,7 @@ describe("existing imported session: subagents without tokens", () => {
   });
 });
 
-describe("lastTranscriptActivityMs reads only the tail", () => {
+describe("lastTranscriptActivityMs reads from the tail", () => {
   it("returns the newest timestamp of a large file without reading it whole", () => {
     const f = path.join(TMP_ROOT, "big.jsonl");
     const filler = JSON.stringify({ timestamp: "2020-01-01T00:00:00.000Z", pad: "x".repeat(900) });
@@ -342,6 +342,45 @@ describe("lastTranscriptActivityMs reads only the tail", () => {
       remoteSync.lastTranscriptActivityMs(f),
       new Date("2026-09-02T00:00:00.000Z").getTime()
     );
+  });
+
+  it("finds the timestamp of a final record larger than the first tail window", () => {
+    const f = path.join(TMP_ROOT, "huge-last.jsonl");
+    const older = JSON.stringify({ timestamp: "2020-01-01T00:00:00.000Z" });
+    // One tool-result record of ~300 KiB, as Claude transcripts can contain.
+    const last = JSON.stringify({
+      timestamp: "2026-09-03T00:00:00.000Z",
+      pad: "z".repeat(300 * 1024),
+    });
+    fs.writeFileSync(f, older + "\n" + last + "\n");
+    // The mirror rewrote the file just now, so mtime alone would read as fresh activity.
+    const now = new Date();
+    fs.utimesSync(f, now, now);
+    assert.equal(
+      remoteSync.lastTranscriptActivityMs(f),
+      new Date("2026-09-03T00:00:00.000Z").getTime()
+    );
+  });
+
+  it("reaches an earlier timestamped line past a large final line without one", () => {
+    const f = path.join(TMP_ROOT, "huge-untimed-last.jsonl");
+    const stamped = JSON.stringify({ timestamp: "2026-09-05T00:00:00.000Z" });
+    const untimed = JSON.stringify({ type: "summary", pad: "v".repeat(200 * 1024) });
+    fs.writeFileSync(f, stamped + "\n" + untimed + "\n");
+    const now = new Date();
+    fs.utimesSync(f, now, now);
+    assert.equal(
+      remoteSync.lastTranscriptActivityMs(f),
+      new Date("2026-09-05T00:00:00.000Z").getTime()
+    );
+  });
+
+  it("falls back to mtime only when no line in the file has a timestamp", () => {
+    const f = path.join(TMP_ROOT, "no-ts.jsonl");
+    fs.writeFileSync(f, JSON.stringify({ pad: "w".repeat(200 * 1024) }) + "\n");
+    const when = new Date("2026-09-04T00:00:00.000Z");
+    fs.utimesSync(f, when, when);
+    assert.equal(remoteSync.lastTranscriptActivityMs(f), when.getTime());
   });
 });
 
