@@ -73,6 +73,37 @@ for (const kind of [
     assert.equal(db.prepare("SELECT status FROM sessions WHERE id=?").get(id).status, "active");
   });
 }
+it("the sweep's own ingest of one cold rollout keeps the census for the next", async () => {
+  const first = fixture();
+  const second = fixture();
+  const select = createCodexProbeFence([first.file, second.file], db);
+  await Promise.resolve();
+  for (const { file } of [first, second])
+    select.ownWrites(() =>
+      ingestCodexTranscript(file, { liveTranscripts: select(absent, file, fs.statSync(file)) })
+    );
+  for (const { id } of [first, second])
+    assert.equal(db.prepare("SELECT status FROM sessions WHERE id=?").get(id).status, "completed");
+});
+it("activity between the sweep's own writes still voids the remaining census", async () => {
+  const first = fixture();
+  const second = fixture();
+  const select = createCodexProbeFence([first.file, second.file], db);
+  select.ownWrites(() =>
+    ingestCodexTranscript(first.file, {
+      liveTranscripts: select(absent, first.file, fs.statSync(first.file)),
+    })
+  );
+  await Promise.resolve();
+  db.prepare("INSERT INTO events(session_id,event_type)VALUES(?,'UserPromptSubmit')").run(first.id);
+  const liveTranscripts = select(absent, second.file, fs.statSync(second.file));
+  assert.equal(liveTranscripts, null);
+  select.ownWrites(() => ingestCodexTranscript(second.file, { liveTranscripts }));
+  assert.equal(
+    db.prepare("SELECT status FROM sessions WHERE id=?").get(second.id).status,
+    "active"
+  );
+});
 it("unobserved paths and unavailable census remain unknown, positive evidence stays safe", () => {
   const { file } = fixture();
   const select = createCodexProbeFence([], db),

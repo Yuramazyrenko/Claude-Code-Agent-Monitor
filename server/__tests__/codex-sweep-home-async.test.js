@@ -89,7 +89,7 @@ for (const stage of ["discovery", "census", "stat", "slice"])
       path,
       console,
       process: { env: { DASHBOARD_CODEX_SYNC_MS: "0" }, platform: "darwin" },
-      createCodexProbeFence: () => () => null,
+      createCodexProbeFence: () => Object.assign(() => null, { ownWrites: (write) => write() }),
       createIngestRetryBudget: () => ({ exhausted: () => false, succeed: () => {} }),
       setTimeout: (f) => {
         initial = f;

@@ -1,7 +1,8 @@
 /**
  * @file CostCoverage.test.tsx
  * @description Checks complete and incomplete rate coverage, including an
- * unsupported tier of an otherwise known model, plus source/provider labels.
+ * unsupported tier of an otherwise known model, plus source/provider labels
+ * and the rate table each product scope links to.
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
 import { it, expect } from "vitest";
@@ -51,4 +52,31 @@ it("marks missing tier rates incomplete without calling the known model unknown"
     "Incomplete estimate: some usage has no applicable rate (gpt-6-sol)."
   );
   expect(screen.getByText("Sources: Selected sources · Products: Codex")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Review pricing" })).toHaveAttribute(
+    "href",
+    "/settings#gpt-pricing"
+  );
+});
+it("labels an unset product scope as the Claude data it reads", () => {
+  render(
+    <MemoryRouter>
+      <CostCoverage
+        scope={{ mode: "local", selected: [] }}
+        unpriced={[
+          {
+            model: "claude-x",
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+          },
+        ]}
+      />
+    </MemoryRouter>
+  );
+  expect(screen.getByText(/Products: Claude Code/)).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Review pricing" })).toHaveAttribute(
+    "href",
+    "/settings#claude-pricing"
+  );
 });
