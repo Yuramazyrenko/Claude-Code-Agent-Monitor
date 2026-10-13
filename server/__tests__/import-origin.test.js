@@ -7,6 +7,7 @@
 
 const { describe, it, before, after } = require("node:test");
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
 const fs = require("fs");
 const http = require("http");
 const os = require("os");
@@ -654,6 +655,59 @@ describe("native Codex rollout ownership after remote ingestion", () => {
       assert.equal(stmts.getCodexIngestState.get(live), undefined);
     });
   }
+
+  it("the live sweep skips a foreign-owned rollout without logging an ingest failure", () => {
+    // Run the real sweep in a child process with its own database and Codex home,
+    // so its watchers cannot touch the other tests in this file.
+    const root = fs.mkdtempSync(path.join(TMP_ROOT, "sweep-"));
+    const sid = codexUuid();
+    const code = `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { db, stmts } = require(${JSON.stringify(path.join(__dirname, "../db.js"))});
+      stmts.insertSession.run(process.argv[1], "remote", "completed", "/remote", "gpt-5.6-terra", null);
+      db.prepare("UPDATE sessions SET provider = 'codex', source = 'src-foreign' WHERE id = ?").run(process.argv[1]);
+      const file = path.join(process.env.DASHBOARD_CODEX_HOME, "sessions", "2026", "09", "01",
+        "rollout-2026-09-01T10-00-00-" + process.argv[1] + ".jsonl");
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const rec = (type, payload) => JSON.stringify({ timestamp: "2026-09-01T10:00:00.000Z", type, payload });
+      fs.writeFileSync(file, [
+        rec("session_meta", { id: process.argv[1], cwd: "/local/codex" }),
+        rec("turn_context", { model: "gpt-5.6-terra" }),
+        rec("event_msg", { type: "user_message", message: "go" }),
+      ].join("\\n") + "\\n");
+      const warnings = [];
+      console.warn = (...args) => warnings.push(args.join(" "));
+      require(${JSON.stringify(path.join(__dirname, "../index.js"))}).startCodexSessionSync(() => {});
+      setTimeout(() => {
+        const row = stmts.getSession.get(process.argv[1]);
+        process.stdout.write(JSON.stringify({
+          failures: warnings.filter((w) => w.includes("[CODEX SYNC]")),
+          source: row.source,
+          cursor: stmts.getCodexIngestState.get(file) || null,
+        }));
+        process.exit(0);
+      }, 1500);
+    `;
+    const result = spawnSync(process.execPath, ["-e", code, sid], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CLAUDE_HOME: path.join(root, "claude"),
+        DASHBOARD_DATA_DIR: path.join(root, "data"),
+        DASHBOARD_DB_PATH: path.join(root, "dashboard.db"),
+        DASHBOARD_CODEX_HOME: path.join(root, "codex"),
+        DASHBOARD_CODEX_SYNC_MS: "0",
+        DASHBOARD_LIVENESS_PROBE: "0",
+        DASHBOARD_REMOTE_SYNC_MS: "0",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const out = JSON.parse(result.stdout);
+    assert.deepEqual(out.failures, [], "a foreign owner is a skip, not a retryable ingest failure");
+    assert.equal(out.source, "src-foreign");
+    assert.equal(out.cursor, null);
+  });
 
   it("keeps the native owner when the remote copy arrives later", async () => {
     const sid = codexUuid();
